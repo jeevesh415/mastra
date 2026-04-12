@@ -1,10 +1,8 @@
-import { useState } from 'react';
 import {
   File,
   Folder,
   FolderOpen,
   ChevronRight,
-  ChevronDown,
   FileText,
   FileCode,
   FileJson,
@@ -19,16 +17,17 @@ import {
   Database,
   HardDrive,
 } from 'lucide-react';
+import { useState } from 'react';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { coldarkDark } from 'react-syntax-highlighter/dist/cjs/styles/prism';
-import { Button } from '@/ds/components/Button';
-import { AlertDialog } from '@/ds/components/AlertDialog';
-import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/ds/components/Tooltip';
-import { CopyButton } from '@/ds/components/CopyButton';
-import { AmazonIcon } from '@/ds/icons/AmazonIcon';
-import { GoogleIcon } from '@/ds/icons/GoogleIcon';
-import { AzureIcon } from '@/ds/icons/AzureIcon';
 import type { FileEntry } from '../types';
+import { AlertDialog } from '@/ds/components/AlertDialog';
+import { Button } from '@/ds/components/Button';
+import { CopyButton } from '@/ds/components/CopyButton';
+import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/ds/components/Tooltip';
+import { AmazonIcon } from '@/ds/icons/AmazonIcon';
+import { AzureIcon } from '@/ds/icons/AzureIcon';
+import { GoogleIcon } from '@/ds/icons/GoogleIcon';
 
 // =============================================================================
 // Type Definitions
@@ -289,7 +288,7 @@ export function FileBrowser({
                 const name = prompt('Directory name:');
                 if (name) {
                   const fullPath = isRoot ? name : `${currentPath}/${name}`;
-                  onCreateDirectory(fullPath);
+                  void onCreateDirectory(fullPath);
                 }
               }}
             >
@@ -567,37 +566,6 @@ export function FileViewer({ path, content, isLoading, mimeType, onClose }: File
         ) : (
           <pre className="p-4 text-sm text-neutral5 whitespace-pre-wrap font-mono overflow-x-auto">{content}</pre>
         )}
-      </div>
-    </div>
-  );
-}
-
-// =============================================================================
-// Workspace Not Configured Component
-// =============================================================================
-
-export function WorkspaceNotConfigured() {
-  return (
-    <div className="grid place-items-center py-16">
-      <div className="flex flex-col items-center text-center max-w-md">
-        <div className="p-4 rounded-full bg-surface4 mb-4">
-          <Folder className="h-8 w-8 text-neutral3" />
-        </div>
-        <h2 className="text-lg font-medium text-neutral6 mb-2">Workspace Not Configured</h2>
-        <p className="text-sm text-neutral4 mb-6">
-          No workspace is configured. Add a workspace to your Mastra configuration to manage files, skills, and enable
-          semantic search.
-        </p>
-        <Button
-          size="lg"
-          variant="default"
-          as="a"
-          href="https://mastra.ai/en/docs/workspace/overview"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Learn about Workspaces
-        </Button>
       </div>
     </div>
   );
