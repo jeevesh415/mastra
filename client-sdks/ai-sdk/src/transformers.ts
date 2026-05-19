@@ -79,6 +79,17 @@ export type WorkflowDataPart = {
   };
 };
 
+export type WorkflowStepDataPart = {
+  type: 'data-workflow-step' | 'data-tool-workflow-step';
+  id: string;
+  data: {
+    name: string;
+    status: WorkflowRunStatus;
+    stepId: string;
+    step: StepResult;
+  };
+};
+
 export type NetworkDataPart = {
   type: 'data-network' | 'data-tool-network';
   id: string;
@@ -101,6 +112,72 @@ export type AgentDataPart = {
 const PRIMITIVE_CACHE_SYMBOL = Symbol('primitive-cache');
 
 type ConvertMastraChunkToAISDK = <OUTPUT>(args: { chunk: ChunkType<OUTPUT>; mode?: 'generate' | 'stream' }) => any;
+
+type BufferedWorkflowState = {
+  name: string;
+  steps: Record<string, StepResult>;
+};
+
+function cloneWorkflowStep(step: StepResult, includeOutput: boolean): StepResult {
+  return {
+    name: step.name,
+    status: step.status,
+    input: step.input,
+    output: includeOutput ? step.output : null,
+    suspendPayload: step.suspendPayload,
+    resumePayload: step.resumePayload,
+  };
+}
+
+function serializeWorkflowSteps(
+  steps: Record<string, StepResult>,
+  { includeOutputs }: { includeOutputs: boolean },
+): Record<string, StepResult> {
+  return Object.fromEntries(Object.entries(steps).map(([id, step]) => [id, cloneWorkflowStep(step, includeOutputs)]));
+}
+
+function createWorkflowDataPart(args: {
+  current: BufferedWorkflowState;
+  isNested?: boolean;
+  runId: string;
+  status: WorkflowRunStatus;
+  includeOutputs?: boolean;
+  output?: WorkflowDataPart['data']['output'];
+}): WorkflowDataPart {
+  const { current, isNested, runId, status, includeOutputs = false, output = null } = args;
+
+  return {
+    type: isNested ? 'data-tool-workflow' : 'data-workflow',
+    id: runId,
+    data: {
+      name: current.name,
+      status,
+      steps: serializeWorkflowSteps(current.steps, { includeOutputs }),
+      output,
+    },
+  };
+}
+
+function createWorkflowStepDataPart(args: {
+  current: BufferedWorkflowState;
+  isNested?: boolean;
+  runId: string;
+  status: WorkflowRunStatus;
+  stepId: string;
+}): WorkflowStepDataPart {
+  const { current, isNested, runId, status, stepId } = args;
+
+  return {
+    type: isNested ? 'data-tool-workflow-step' : 'data-workflow-step',
+    id: `${runId}:${stepId}`,
+    data: {
+      name: current.name,
+      status,
+      stepId,
+      step: cloneWorkflowStep(current.steps[stepId]!, true),
+    },
+  };
+}
 
 export function createWorkflowStreamToAISDKTransformer<UI_CHUNK>(
   convertMastraChunkToAISDK: ConvertMastraChunkToAISDK,
@@ -125,6 +202,7 @@ export function createWorkflowStreamToAISDKTransformer<UI_CHUNK>(
       }
     | UI_CHUNK
     | WorkflowDataPart
+    | WorkflowStepDataPart
     | ChunkType
     | ToolAgentChunkType
     | ToolWorkflowChunkType
@@ -152,12 +230,14 @@ export function createWorkflowStreamToAISDKTransformer<UI_CHUNK>(
         },
         convertMastraChunkToAISDK,
       );
-      if (Array.isArray(transformed)) {
-        for (const c of transformed) {
-          if (c) controller.enqueue(c as UI_CHUNK);
+      if (transformed) {
+        if (Array.isArray(transformed)) {
+          for (const item of transformed) {
+            controller.enqueue(item as UI_CHUNK);
+          }
+        } else {
+          controller.enqueue(transformed as UI_CHUNK);
         }
-      } else if (transformed) {
-        controller.enqueue(transformed as UI_CHUNK);
       }
     },
   });
@@ -322,12 +402,14 @@ export function createAgentStreamToAISDKTransformer<OUTPUT>(
               undefined,
               convertMastraChunkToAISDK,
             );
-            if (Array.isArray(workflowChunk)) {
-              for (const c of workflowChunk) {
-                if (c) controller.enqueue(c);
+            if (workflowChunk) {
+              if (Array.isArray(workflowChunk)) {
+                for (const item of workflowChunk) {
+                  controller.enqueue(item);
+                }
+              } else {
+                controller.enqueue(workflowChunk);
               }
-            } else if (workflowChunk) {
-              controller.enqueue(workflowChunk);
             }
           } else if (transformedChunk.type === 'tool-network') {
             const payload = transformedChunk.payload;
@@ -433,6 +515,7 @@ function ensureAgentRunState(bufferedSteps: Map<string, any>, runId: string) {
       sources: [],
       files: [],
       toolCalls: [],
+      pendingToolCalls: [],
       toolResults: [],
       request: {},
       response: {
@@ -450,6 +533,74 @@ function ensureAgentRunState(bufferedSteps: Map<string, any>, runId: string) {
   return bufferedSteps.get(runId)!;
 }
 
+type PendingAgentToolCall = {
+  toolCallId: string;
+  toolName: string;
+  argsText: string;
+  state: 'input-streaming' | 'input-available';
+  providerExecuted?: boolean;
+  providerMetadata?: unknown;
+  dynamic?: boolean;
+};
+
+type PendingToolCallUpdate = Partial<
+  Pick<PendingAgentToolCall, 'toolName' | 'argsText' | 'state' | 'providerExecuted' | 'providerMetadata' | 'dynamic'>
+>;
+
+function upsertPendingToolCall(
+  pendingToolCalls: PendingAgentToolCall[] = [],
+  toolCallId: string,
+  updates: PendingToolCallUpdate,
+) {
+  const existingIndex = pendingToolCalls.findIndex(call => call.toolCallId === toolCallId);
+  if (existingIndex === -1) {
+    return [
+      ...pendingToolCalls,
+      {
+        toolCallId,
+        toolName: updates.toolName || '',
+        argsText: updates.argsText || '',
+        state: updates.state || 'input-streaming',
+        ...(updates.providerExecuted != null ? { providerExecuted: updates.providerExecuted } : {}),
+        ...(updates.providerMetadata != null ? { providerMetadata: updates.providerMetadata } : {}),
+        ...(updates.dynamic != null ? { dynamic: updates.dynamic } : {}),
+      },
+    ];
+  }
+
+  return pendingToolCalls.map((call, index) => {
+    if (index !== existingIndex) return call;
+    return {
+      ...call,
+      ...updates,
+      toolName: updates.toolName || call.toolName,
+      argsText: updates.argsText ?? call.argsText,
+    };
+  });
+}
+
+function appendPendingToolCallArgs(
+  pendingToolCalls: PendingAgentToolCall[] = [],
+  payload: {
+    toolCallId: string;
+    argsTextDelta?: string;
+    toolName?: string;
+    providerMetadata?: PendingAgentToolCall['providerMetadata'];
+  },
+) {
+  const existing = pendingToolCalls.find(call => call.toolCallId === payload.toolCallId);
+  return upsertPendingToolCall(pendingToolCalls, payload.toolCallId, {
+    toolName: payload.toolName || existing?.toolName || '',
+    argsText: `${existing?.argsText || ''}${payload.argsTextDelta || ''}`,
+    state: 'input-streaming',
+    providerMetadata: payload.providerMetadata ?? existing?.providerMetadata,
+  });
+}
+
+function removePendingToolCall(pendingToolCalls: PendingAgentToolCall[] = [], toolCallId: string) {
+  return pendingToolCalls.filter(call => call.toolCallId !== toolCallId);
+}
+
 export function transformAgent<OUTPUT>(payload: ChunkType<OUTPUT>, bufferedSteps: Map<string, any>) {
   let hasChanged = false;
   switch (payload.type) {
@@ -465,6 +616,7 @@ export function transformAgent<OUTPUT>(payload: ChunkType<OUTPUT>, bufferedSteps
         sources: [],
         files: [],
         toolCalls: [],
+        pendingToolCalls: [],
         toolResults: [],
         request: {},
         response: {
@@ -479,6 +631,50 @@ export function transformAgent<OUTPUT>(payload: ChunkType<OUTPUT>, bufferedSteps
       });
       hasChanged = true;
       break;
+    case 'tool-call-input-streaming-start': {
+      const toolInputStartRun = ensureAgentRunState(bufferedSteps, payload.runId!);
+      const existing = toolInputStartRun.pendingToolCalls?.find(
+        (call: PendingAgentToolCall) => call.toolCallId === payload.payload.toolCallId,
+      );
+      bufferedSteps.set(payload.runId!, {
+        ...toolInputStartRun,
+        pendingToolCalls: upsertPendingToolCall(toolInputStartRun.pendingToolCalls, payload.payload.toolCallId, {
+          toolName: payload.payload.toolName,
+          argsText: existing?.argsText ?? '',
+          state: 'input-streaming',
+          providerExecuted: payload.payload.providerExecuted,
+          providerMetadata: payload.payload.providerMetadata,
+          dynamic: payload.payload.dynamic,
+        }),
+      });
+      hasChanged = true;
+      break;
+    }
+    case 'tool-call-delta': {
+      const toolCallDeltaRun = ensureAgentRunState(bufferedSteps, payload.runId!);
+      bufferedSteps.set(payload.runId!, {
+        ...toolCallDeltaRun,
+        pendingToolCalls: appendPendingToolCallArgs(toolCallDeltaRun.pendingToolCalls, payload.payload),
+      });
+      hasChanged = true;
+      break;
+    }
+    case 'tool-call-input-streaming-end': {
+      const toolInputEndRun = ensureAgentRunState(bufferedSteps, payload.runId!);
+      const existing = toolInputEndRun.pendingToolCalls?.find(
+        (call: PendingAgentToolCall) => call.toolCallId === payload.payload.toolCallId,
+      );
+      bufferedSteps.set(payload.runId!, {
+        ...toolInputEndRun,
+        pendingToolCalls: upsertPendingToolCall(toolInputEndRun.pendingToolCalls, payload.payload.toolCallId, {
+          toolName: existing?.toolName || '',
+          state: 'input-available',
+          providerMetadata: payload.payload.providerMetadata ?? existing?.providerMetadata,
+        }),
+      });
+      hasChanged = true;
+      break;
+    }
     case 'finish':
       bufferedSteps.set(payload.runId!, {
         ...bufferedSteps.get(payload.runId!),
@@ -527,6 +723,10 @@ export function transformAgent<OUTPUT>(payload: ChunkType<OUTPUT>, bufferedSteps
     case 'tool-call':
       bufferedSteps.set(payload.runId!, {
         ...bufferedSteps.get(payload.runId!),
+        pendingToolCalls: removePendingToolCall(
+          bufferedSteps.get(payload.runId)!.pendingToolCalls,
+          payload.payload.toolCallId,
+        ),
         toolCalls: [...bufferedSteps.get(payload.runId)!.toolCalls, payload.payload],
       });
       hasChanged = true;
@@ -535,6 +735,7 @@ export function transformAgent<OUTPUT>(payload: ChunkType<OUTPUT>, bufferedSteps
       const toolResultRun = ensureAgentRunState(bufferedSteps, payload.runId!);
       bufferedSteps.set(payload.runId!, {
         ...toolResultRun,
+        pendingToolCalls: removePendingToolCall(toolResultRun.pendingToolCalls, payload.payload.toolCallId),
         toolResults: [...toolResultRun.toolResults, payload.payload],
       });
       hasChanged = true;
@@ -572,6 +773,7 @@ export function transformAgent<OUTPUT>(payload: ChunkType<OUTPUT>, bufferedSteps
         ...stepRunWithoutSteps,
         text: stepText,
         reasoning: stepReasoning,
+        pendingToolCalls: [],
         stepType: stepRun.steps.length === 0 ? 'initial' : 'tool-result',
         reasoningText: stepReasoning.join(''),
         staticToolCalls: stepRun.toolCalls.filter(
@@ -613,6 +815,7 @@ export function transformAgent<OUTPUT>(payload: ChunkType<OUTPUT>, bufferedSteps
         sources: [],
         files: [],
         toolCalls: [],
+        pendingToolCalls: [],
         toolResults: [],
         usage: payload.payload.output.usage,
         warnings: payload.payload.stepResult.warnings || [],
@@ -641,13 +844,7 @@ export function transformAgent<OUTPUT>(payload: ChunkType<OUTPUT>, bufferedSteps
 
 export function transformWorkflow<OUTPUT>(
   payload: ChunkType<OUTPUT>,
-  bufferedWorkflows: Map<
-    string,
-    {
-      name: string;
-      steps: Record<string, StepResult>;
-    }
-  >,
+  bufferedWorkflows: Map<string, BufferedWorkflowState>,
   isNested?: boolean,
   includeTextStreamParts?: boolean,
   streamOptions?: { sendReasoning?: boolean; sendSources?: boolean },
@@ -659,16 +856,12 @@ export function transformWorkflow<OUTPUT>(
         name: payload.payload.workflowId,
         steps: {},
       });
-      return {
-        type: isNested ? 'data-tool-workflow' : 'data-workflow',
-        id: payload.runId,
-        data: {
-          name: bufferedWorkflows.get(payload.runId!)!.name,
-          status: 'running',
-          steps: bufferedWorkflows.get(payload.runId!)!.steps,
-          output: null,
-        },
-      } as const;
+      return createWorkflowDataPart({
+        current: bufferedWorkflows.get(payload.runId!)!,
+        isNested,
+        runId: payload.runId!,
+        status: 'running',
+      });
     case 'workflow-step-start': {
       const current = bufferedWorkflows.get(payload.runId!) || { name: '', steps: {} };
       current.steps[payload.payload.id] = {
@@ -680,16 +873,12 @@ export function transformWorkflow<OUTPUT>(
         resumePayload: null,
       };
       bufferedWorkflows.set(payload.runId!, current);
-      return {
-        type: isNested ? 'data-tool-workflow' : 'data-workflow',
-        id: payload.runId,
-        data: {
-          name: current.name,
-          status: 'running',
-          steps: current.steps,
-          output: null,
-        },
-      } as const;
+      return createWorkflowDataPart({
+        current,
+        isNested,
+        runId: payload.runId!,
+        status: 'running',
+      });
     }
     case 'workflow-step-result': {
       const current = bufferedWorkflows.get(payload.runId!);
@@ -699,16 +888,21 @@ export function transformWorkflow<OUTPUT>(
         status: payload.payload.status,
         output: payload.payload.output ?? null,
       };
-      return {
-        type: isNested ? 'data-tool-workflow' : 'data-workflow',
-        id: payload.runId,
-        data: {
-          name: current.name,
+      return [
+        createWorkflowDataPart({
+          current,
+          isNested,
+          runId: payload.runId!,
           status: 'running',
-          steps: current.steps,
-          output: null,
-        },
-      } as const;
+        }),
+        createWorkflowStepDataPart({
+          current,
+          isNested,
+          runId: payload.runId!,
+          status: 'running',
+          stepId: payload.payload.id,
+        }),
+      ] as const;
     }
     case 'workflow-step-suspended': {
       const current = bufferedWorkflows.get(payload.runId!);
@@ -720,30 +914,33 @@ export function transformWorkflow<OUTPUT>(
         resumePayload: payload.payload.resumePayload ?? null,
         output: null,
       } satisfies StepResult;
-      return {
-        type: isNested ? 'data-tool-workflow' : 'data-workflow',
-        id: payload.runId,
-        data: {
-          name: current.name,
+      return [
+        createWorkflowDataPart({
+          current,
+          isNested,
+          runId: payload.runId!,
           status: 'suspended',
-          steps: current.steps,
-          output: null,
-        },
-      } as const;
+        }),
+        createWorkflowStepDataPart({
+          current,
+          isNested,
+          runId: payload.runId!,
+          status: 'suspended',
+          stepId: payload.payload.id,
+        }),
+      ] as const;
     }
     case 'workflow-finish': {
       const current = bufferedWorkflows.get(payload.runId!);
       if (!current) return null;
-      return {
-        type: isNested ? 'data-tool-workflow' : 'data-workflow',
-        id: payload.runId,
-        data: {
-          name: current.name,
-          steps: current.steps,
-          output: payload.payload.output ?? null,
-          status: payload.payload.workflowStatus,
-        },
-      } as const;
+      return createWorkflowDataPart({
+        current,
+        isNested,
+        runId: payload.runId!,
+        status: payload.payload.workflowStatus,
+        includeOutputs: true,
+        output: payload.payload.output ?? null,
+      });
     }
     case 'workflow-step-output': {
       const output = payload.payload.output;
@@ -812,7 +1009,7 @@ export function transformWorkflow<OUTPUT>(
   }
 }
 
-type TransformNetworkResult = InferUIMessageChunk<UIMessage> | NetworkDataPart | DataChunkType;
+type TransformNetworkResult = InferUIMessageChunk<UIMessage> | NetworkDataPart | DataChunkType | WorkflowStepDataPart;
 
 export function transformNetwork(
   payload: NetworkChunkType,
@@ -1207,8 +1404,11 @@ export function transformNetwork(
 
         step[PRIMITIVE_CACHE_SYMBOL] = step[PRIMITIVE_CACHE_SYMBOL] || new Map();
         const result = transformWorkflow(payload.payload as WorkflowStreamEvent, step[PRIMITIVE_CACHE_SYMBOL]);
-        if (result && 'data' in result) {
-          const data = result.data;
+        const workflowResult = Array.isArray(result)
+          ? result.find(item => item?.type === 'data-workflow' || item?.type === 'data-tool-workflow')
+          : result;
+        if (workflowResult && 'data' in workflowResult) {
+          const data = workflowResult.data;
           step.task = data;
 
           if (data.name && step.task) {
@@ -1217,7 +1417,7 @@ export function transformNetwork(
         }
 
         bufferedNetworks.set(payload.runId!, current);
-        return {
+        const networkChunk = {
           type: isNested ? 'data-tool-network' : 'data-network',
           id: payload.runId!,
           data: {
@@ -1225,6 +1425,10 @@ export function transformNetwork(
             status: 'running',
           },
         } as const;
+        if (Array.isArray(result)) {
+          return [networkChunk, ...result.filter((r): r is TransformNetworkResult => r != null)];
+        }
+        return networkChunk;
       }
 
       // return the chunk as is if it's not a known type

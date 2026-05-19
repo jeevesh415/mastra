@@ -1,5 +1,6 @@
 import { CacheKeyGenerator } from '../cache/CacheKeyGenerator';
 import type { MastraDBMessage, MastraMessageContentV2 } from '../state/types';
+import { stampPart } from '../utils/stamp-part';
 
 /**
  * MessageMerger - Handles complex logic for merging assistant messages
@@ -45,6 +46,13 @@ export class MessageMerger {
     // Don't merge into sealed messages (e.g., messages that have been observed)
     if (MessageMerger.isSealed(latestMessage)) return false;
 
+    if (
+      (latestMessage.content?.metadata as { mastra?: { responseBoundary?: boolean } } | undefined)?.mastra
+        ?.responseBoundary
+    ) {
+      return false;
+    }
+
     // Don't merge completion result message (network uses completionResult, supervisor uses isTaskCompleteResult)
     if (
       incomingMessage.content.metadata?.completionResult ||
@@ -52,6 +60,12 @@ export class MessageMerger {
       incomingMessage.content.metadata?.isTaskCompleteResult ||
       latestMessage.content.metadata?.isTaskCompleteResult
     ) {
+      return false;
+    }
+
+    const latestParts = latestMessage.content?.parts ?? [];
+    const latestOnlyHasDataParts = latestParts.length > 0 && latestParts.every(part => part.type.startsWith('data-'));
+    if (latestOnlyHasDataParts && latestMessage.id !== incomingMessage.id) {
       return false;
     }
 
@@ -83,6 +97,13 @@ export class MessageMerger {
     // Update timestamp
     latestMessage.createdAt = incomingMessage.createdAt || latestMessage.createdAt;
 
+    if (incomingMessage.content.metadata) {
+      latestMessage.content.metadata = {
+        ...(latestMessage.content.metadata ?? {}),
+        ...incomingMessage.content.metadata,
+      };
+    }
+
     // Used for mapping indexes for incomingMessage parts to corresponding indexes in latestMessage
     const toolResultAnchorMap = new Map<number, number>();
     const partsToAdd = new Map<number, MastraMessageContentV2['parts'][number]>();
@@ -90,9 +111,10 @@ export class MessageMerger {
     for (const [index, part] of incomingMessage.content.parts.entries()) {
       // If the incoming part is a tool-invocation result, find the corresponding call in the latest message
       if (part.type === 'tool-invocation') {
+        if (!part.toolInvocation) continue;
         const existingCallPart = [...latestMessage.content.parts]
           .reverse()
-          .find(p => p.type === 'tool-invocation' && p.toolInvocation.toolCallId === part.toolInvocation.toolCallId);
+          .find(p => p.type === 'tool-invocation' && p.toolInvocation?.toolCallId === part.toolInvocation.toolCallId);
 
         const existingCallToolInvocation = !!existingCallPart && existingCallPart.type === 'tool-invocation';
 
@@ -304,16 +326,24 @@ export class MessageMerger {
         latestMessage.content.parts.length > 0 &&
         latestMessage.content.parts.at(-1)?.type === 'tool-invocation';
 
+      const previousStepStart = [...latestMessage.content.parts].reverse().find(p => p.type === 'step-start');
+      const stepStartPart = previousStepStart?.model
+        ? stampPart({
+            type: 'step-start' as const,
+            model: previousStepStart.model,
+          })
+        : ({ type: 'step-start' as const } as MastraMessageContentV2['parts'][number]);
+
       if (typeof insertAt === 'number') {
         if (needsStepStart) {
-          latestMessage.content.parts.splice(insertAt, 0, { type: 'step-start' });
+          latestMessage.content.parts.splice(insertAt, 0, stepStartPart);
           latestMessage.content.parts.splice(insertAt + 1, 0, part);
         } else {
           latestMessage.content.parts.splice(insertAt, 0, part);
         }
       } else {
         if (needsStepStart) {
-          latestMessage.content.parts.push({ type: 'step-start' });
+          latestMessage.content.parts.push(stepStartPart);
         }
         latestMessage.content.parts.push(part);
       }

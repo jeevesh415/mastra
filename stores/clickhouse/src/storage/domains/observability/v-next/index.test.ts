@@ -11,9 +11,17 @@
  * clickhouse store directory, or set CLICKHOUSE_URL/CLICKHOUSE_USERNAME/CLICKHOUSE_PASSWORD.
  */
 import { createClient } from '@clickhouse/client';
+import { coreFeatures } from '@mastra/core/features';
 import { EntityType, SpanType } from '@mastra/core/observability';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { buildRetentionDDL } from './ddl';
+import {
+  ALL_MIGRATIONS,
+  buildAllMvDDL,
+  buildAllTableDDL,
+  buildRetentionDDL,
+  buildRetentionEntries,
+  parseTtlExpression,
+} from './ddl';
 import { ObservabilityStorageClickhouseVNext } from '.';
 
 vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
@@ -46,6 +54,953 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     expect(storage.observabilityStrategy).toEqual({
       preferred: 'insert-only',
       supported: ['insert-only'],
+    });
+  });
+
+  describe('delta polling', () => {
+    async function withFallbackStorage<T>(
+      run: (fallbackStorage: ObservabilityStorageClickhouseVNext) => Promise<T>,
+    ): Promise<T> {
+      let adminClient: ReturnType<typeof createClient> | null = createClient({
+        url: process.env.CLICKHOUSE_URL || 'http://localhost:8123',
+        username: process.env.CLICKHOUSE_USERNAME || 'default',
+        password: process.env.CLICKHOUSE_PASSWORD || 'password',
+        clickhouse_settings: {
+          date_time_input_format: 'best_effort',
+          date_time_output_format: 'iso',
+          use_client_time_zone: 1,
+          output_format_json_quote_64bit_integers: 0,
+        },
+      });
+      const database = `fallback_delta_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      await adminClient.command({ query: `CREATE DATABASE ${database}` });
+
+      let client: ReturnType<typeof createClient> | null = createClient({
+        url: process.env.CLICKHOUSE_URL || 'http://localhost:8123',
+        username: process.env.CLICKHOUSE_USERNAME || 'default',
+        password: process.env.CLICKHOUSE_PASSWORD || 'password',
+        database,
+        clickhouse_settings: {
+          date_time_input_format: 'best_effort',
+          date_time_output_format: 'iso',
+          use_client_time_zone: 1,
+          output_format_json_quote_64bit_integers: 0,
+        },
+      });
+
+      let fallbackStorage: ObservabilityStorageClickhouseVNext | null = new ObservabilityStorageClickhouseVNext({
+        client,
+        deltaCursorStrategy: 'fallback',
+      });
+
+      try {
+        await fallbackStorage.init();
+        await fallbackStorage.dangerouslyClearAll();
+        return await run(fallbackStorage);
+      } finally {
+        if (fallbackStorage) {
+          await fallbackStorage.dangerouslyClearAll();
+        }
+        if (client) {
+          await client.close();
+        }
+        if (adminClient) {
+          await adminClient.command({ query: `DROP DATABASE IF EXISTS ${database} SYNC` });
+          await adminClient.close();
+        }
+      }
+    }
+
+    it('advertises delta list capabilities when the feature is enabled', () => {
+      expect(storage.getFeatures()).toEqual(['delta-polling']);
+    });
+
+    it('hides delta list capabilities when the feature is disabled', () => {
+      coreFeatures.delete('observability-delta-polling');
+
+      try {
+        expect(storage.getFeatures()).toBeUndefined();
+      } finally {
+        coreFeatures.add('observability-delta-polling');
+      }
+    });
+
+    it('supports page deltaCursor and delta polling for traces', async () => {
+      await storage.createSpan({
+        span: {
+          traceId: 'delta-trace-1',
+          spanId: 'delta-trace-root-1',
+          parentSpanId: null,
+          name: 'delta-trace-root',
+          spanType: SpanType.AGENT_RUN,
+          isEvent: false,
+          entityType: EntityType.AGENT,
+          entityId: 'delta-trace-agent',
+          entityName: 'delta-trace-agent',
+          userId: null,
+          organizationId: null,
+          resourceId: null,
+          runId: null,
+          sessionId: null,
+          threadId: null,
+          requestId: null,
+          environment: 'delta',
+          source: null,
+          serviceName: null,
+          scope: null,
+          attributes: null,
+          metadata: null,
+          tags: null,
+          links: null,
+          input: null,
+          output: null,
+          error: null,
+          startedAt: new Date('2026-05-01T00:00:00Z'),
+          endedAt: new Date('2026-05-01T00:00:01Z'),
+        },
+      });
+
+      const page = await waitForValue(
+        () => storage.listTraces({ filters: { entityName: 'delta-trace-agent' } }),
+        result => result.spans.length === 1 && typeof result.deltaCursor === 'string',
+      );
+      expect(page.spans[0]!.traceId).toBe('delta-trace-1');
+
+      const bootstrap = await storage.listTraces({ mode: 'delta', filters: { entityName: 'delta-trace-agent' } });
+      expect(bootstrap.spans).toEqual([]);
+      expect(bootstrap.delta).toEqual({ limit: 10, hasMore: false });
+      expect(bootstrap.deltaCursor).toBeTruthy();
+
+      await storage.createSpan({
+        span: {
+          traceId: 'delta-trace-2',
+          spanId: 'delta-trace-root-2',
+          parentSpanId: null,
+          name: 'delta-trace-root',
+          spanType: SpanType.AGENT_RUN,
+          isEvent: false,
+          entityType: EntityType.AGENT,
+          entityId: 'delta-trace-agent',
+          entityName: 'delta-trace-agent',
+          userId: null,
+          organizationId: null,
+          resourceId: null,
+          runId: null,
+          sessionId: null,
+          threadId: null,
+          requestId: null,
+          environment: 'delta',
+          source: null,
+          serviceName: null,
+          scope: null,
+          attributes: null,
+          metadata: null,
+          tags: null,
+          links: null,
+          input: null,
+          output: null,
+          error: null,
+          startedAt: new Date('2026-05-01T00:00:02Z'),
+          endedAt: new Date('2026-05-01T00:00:03Z'),
+        },
+      });
+
+      const delta = await waitForValue(
+        () =>
+          storage.listTraces({
+            mode: 'delta',
+            after: bootstrap.deltaCursor!,
+            filters: { entityName: 'delta-trace-agent' },
+          }),
+        result => result.spans.length === 1,
+      );
+      expect(delta.spans.map(span => span.traceId)).toEqual(['delta-trace-2']);
+      expect(delta.delta).toEqual({ limit: 10, hasMore: false });
+      expect(delta.deltaCursor).toBeTruthy();
+    });
+
+    it('supports page deltaCursor and delta polling for branches', async () => {
+      await storage.batchCreateSpans({
+        records: [
+          {
+            traceId: 'delta-branch-trace-1',
+            spanId: 'delta-branch-root-1',
+            parentSpanId: null,
+            name: 'root',
+            spanType: SpanType.WORKFLOW_RUN,
+            isEvent: false,
+            entityType: EntityType.WORKFLOW_RUN,
+            entityId: 'wf-delta',
+            entityName: 'wf-delta',
+            userId: null,
+            organizationId: null,
+            resourceId: null,
+            runId: null,
+            sessionId: null,
+            threadId: null,
+            requestId: null,
+            environment: null,
+            source: null,
+            serviceName: null,
+            scope: null,
+            attributes: null,
+            metadata: null,
+            tags: null,
+            links: null,
+            input: null,
+            output: null,
+            error: null,
+            startedAt: new Date('2026-05-02T00:00:00Z'),
+            endedAt: new Date('2026-05-02T00:00:01Z'),
+          },
+          {
+            traceId: 'delta-branch-trace-1',
+            spanId: 'delta-branch-anchor-1',
+            parentSpanId: 'delta-branch-root-1',
+            name: 'observer',
+            spanType: SpanType.AGENT_RUN,
+            isEvent: false,
+            entityType: EntityType.AGENT,
+            entityId: 'delta-branch-agent',
+            entityName: 'delta-branch-agent',
+            userId: null,
+            organizationId: null,
+            resourceId: null,
+            runId: null,
+            sessionId: null,
+            threadId: null,
+            requestId: null,
+            environment: null,
+            source: null,
+            serviceName: null,
+            scope: null,
+            attributes: null,
+            metadata: null,
+            tags: null,
+            links: null,
+            input: null,
+            output: null,
+            error: null,
+            startedAt: new Date('2026-05-02T00:00:00.500Z'),
+            endedAt: new Date('2026-05-02T00:00:00.800Z'),
+          },
+        ],
+      });
+
+      const page = await waitForValue(
+        () => storage.listBranches({ filters: { entityName: 'delta-branch-agent' } }),
+        result => result.branches.length === 1 && typeof result.deltaCursor === 'string',
+      );
+      expect(page.branches[0]!.traceId).toBe('delta-branch-trace-1');
+
+      const bootstrap = await storage.listBranches({ mode: 'delta', filters: { entityName: 'delta-branch-agent' } });
+      expect(bootstrap.branches).toEqual([]);
+      expect(bootstrap.deltaCursor).toBeTruthy();
+
+      await storage.batchCreateSpans({
+        records: [
+          {
+            traceId: 'delta-branch-trace-2',
+            spanId: 'delta-branch-root-2',
+            parentSpanId: null,
+            name: 'root',
+            spanType: SpanType.WORKFLOW_RUN,
+            isEvent: false,
+            entityType: EntityType.WORKFLOW_RUN,
+            entityId: 'wf-delta',
+            entityName: 'wf-delta',
+            userId: null,
+            organizationId: null,
+            resourceId: null,
+            runId: null,
+            sessionId: null,
+            threadId: null,
+            requestId: null,
+            environment: null,
+            source: null,
+            serviceName: null,
+            scope: null,
+            attributes: null,
+            metadata: null,
+            tags: null,
+            links: null,
+            input: null,
+            output: null,
+            error: null,
+            startedAt: new Date('2026-05-02T00:00:02Z'),
+            endedAt: new Date('2026-05-02T00:00:03Z'),
+          },
+          {
+            traceId: 'delta-branch-trace-2',
+            spanId: 'delta-branch-anchor-2',
+            parentSpanId: 'delta-branch-root-2',
+            name: 'observer',
+            spanType: SpanType.AGENT_RUN,
+            isEvent: false,
+            entityType: EntityType.AGENT,
+            entityId: 'delta-branch-agent',
+            entityName: 'delta-branch-agent',
+            userId: null,
+            organizationId: null,
+            resourceId: null,
+            runId: null,
+            sessionId: null,
+            threadId: null,
+            requestId: null,
+            environment: null,
+            source: null,
+            serviceName: null,
+            scope: null,
+            attributes: null,
+            metadata: null,
+            tags: null,
+            links: null,
+            input: null,
+            output: null,
+            error: null,
+            startedAt: new Date('2026-05-02T00:00:02.500Z'),
+            endedAt: new Date('2026-05-02T00:00:02.800Z'),
+          },
+        ],
+      });
+
+      const delta = await waitForValue(
+        () =>
+          storage.listBranches({
+            mode: 'delta',
+            after: bootstrap.deltaCursor!,
+            filters: { entityName: 'delta-branch-agent' },
+          }),
+        result => result.branches.length === 1,
+      );
+      expect(delta.branches.map(span => span.traceId)).toEqual(['delta-branch-trace-2']);
+      expect(delta.deltaCursor).toBeTruthy();
+    });
+
+    it('supports page deltaCursor and delta polling for logs', async () => {
+      await storage.batchCreateLogs({
+        logs: [
+          {
+            logId: 'delta-log-1',
+            timestamp: new Date('2026-05-03T00:00:00Z'),
+            level: 'info',
+            message: 'delta log 1',
+            data: null,
+            traceId: 'delta-log-trace',
+            metadata: null,
+          },
+        ],
+      });
+
+      const page = await waitForValue(
+        () => storage.listLogs({ filters: { traceId: 'delta-log-trace' } }),
+        result => result.logs.length === 1 && typeof result.deltaCursor === 'string',
+      );
+      expect(page.logs[0]!.logId).toBe('delta-log-1');
+
+      const bootstrap = await storage.listLogs({ mode: 'delta', filters: { traceId: 'delta-log-trace' } });
+      expect(bootstrap.logs).toEqual([]);
+      expect(bootstrap.deltaCursor).toBeTruthy();
+
+      await storage.batchCreateLogs({
+        logs: [
+          {
+            logId: 'delta-log-2',
+            timestamp: new Date('2026-05-03T00:00:01Z'),
+            level: 'info',
+            message: 'delta log 2',
+            data: null,
+            traceId: 'delta-log-trace',
+            metadata: null,
+          },
+        ],
+      });
+
+      const delta = await waitForValue(
+        () =>
+          storage.listLogs({
+            mode: 'delta',
+            after: bootstrap.deltaCursor!,
+            filters: { traceId: 'delta-log-trace' },
+          }),
+        result => result.logs.length === 1,
+      );
+      expect(delta.logs.map(log => log.logId)).toEqual(['delta-log-2']);
+      expect(delta.deltaCursor).toBeTruthy();
+    });
+
+    it('returns a resumable page deltaCursor for empty filtered logs', async () => {
+      const page = await storage.listLogs({ filters: { traceId: 'delta-log-empty' } });
+      expect(page.logs).toEqual([]);
+      expect(page.deltaCursor).toBeTruthy();
+
+      await storage.batchCreateLogs({
+        logs: [
+          {
+            logId: 'delta-log-empty-1',
+            timestamp: new Date('2026-05-03T00:00:02Z'),
+            level: 'info',
+            message: 'delta log after empty page',
+            data: null,
+            traceId: 'delta-log-empty',
+            metadata: null,
+          },
+        ],
+      });
+
+      const delta = await waitForValue(
+        () =>
+          storage.listLogs({
+            mode: 'delta',
+            after: page.deltaCursor!,
+            filters: { traceId: 'delta-log-empty' },
+          }),
+        result => result.logs.length === 1,
+      );
+      expect(delta.logs.map(log => log.logId)).toEqual(['delta-log-empty-1']);
+    });
+
+    it('supports page deltaCursor and delta polling for metrics', async () => {
+      await storage.batchCreateMetrics({
+        metrics: [
+          {
+            metricId: 'delta-metric-1',
+            timestamp: new Date('2026-05-04T00:00:00Z'),
+            name: 'delta_metric',
+            value: 1,
+            labels: {},
+          },
+        ],
+      });
+
+      const page = await waitForValue(
+        () => storage.listMetrics({ filters: { name: ['delta_metric'] } }),
+        result => result.metrics.length === 1 && typeof result.deltaCursor === 'string',
+      );
+      expect(page.metrics[0]!.metricId).toBe('delta-metric-1');
+
+      const bootstrap = await storage.listMetrics({ mode: 'delta', filters: { name: ['delta_metric'] } });
+      expect(bootstrap.metrics).toEqual([]);
+      expect(bootstrap.deltaCursor).toBeTruthy();
+
+      await storage.batchCreateMetrics({
+        metrics: [
+          {
+            metricId: 'delta-metric-2',
+            timestamp: new Date('2026-05-04T00:00:01Z'),
+            name: 'delta_metric',
+            value: 2,
+            labels: {},
+          },
+        ],
+      });
+
+      const delta = await waitForValue(
+        () =>
+          storage.listMetrics({
+            mode: 'delta',
+            after: bootstrap.deltaCursor!,
+            filters: { name: ['delta_metric'] },
+          }),
+        result => result.metrics.length === 1,
+      );
+      expect(delta.metrics.map(metric => metric.metricId)).toEqual(['delta-metric-2']);
+      expect(delta.deltaCursor).toBeTruthy();
+    });
+
+    it('supports page deltaCursor and delta polling for scores', async () => {
+      await storage.createScore({
+        score: {
+          scoreId: 'delta-score-1',
+          timestamp: new Date('2026-05-05T00:00:00Z'),
+          traceId: 'delta-score-trace-1',
+          spanId: null,
+          scorerId: 'delta-scorer',
+          score: 0.1,
+          reason: null,
+          experimentId: null,
+          metadata: null,
+        },
+      });
+
+      const page = await waitForValue(
+        () => storage.listScores({ filters: { scorerId: 'delta-scorer' } as any }),
+        result => result.scores.length === 1 && typeof result.deltaCursor === 'string',
+      );
+      expect(page.scores[0]!.scoreId).toBe('delta-score-1');
+
+      const bootstrap = await storage.listScores({ mode: 'delta', filters: { scorerId: 'delta-scorer' } as any });
+      expect(bootstrap.scores).toEqual([]);
+      expect(bootstrap.deltaCursor).toBeTruthy();
+
+      await storage.createScore({
+        score: {
+          scoreId: 'delta-score-2',
+          timestamp: new Date('2026-05-05T00:00:01Z'),
+          traceId: 'delta-score-trace-2',
+          spanId: null,
+          scorerId: 'delta-scorer',
+          score: 0.2,
+          reason: null,
+          experimentId: null,
+          metadata: null,
+        },
+      });
+
+      const delta = await waitForValue(
+        () =>
+          storage.listScores({
+            mode: 'delta',
+            after: bootstrap.deltaCursor!,
+            filters: { scorerId: 'delta-scorer' } as any,
+          }),
+        result => result.scores.length === 1,
+      );
+      expect(delta.scores.map(score => score.scoreId)).toEqual(['delta-score-2']);
+      expect(delta.deltaCursor).toBeTruthy();
+    });
+
+    it('supports page deltaCursor and delta polling for feedback', async () => {
+      await storage.createFeedback({
+        feedback: {
+          feedbackId: 'delta-feedback-1',
+          timestamp: new Date('2026-05-06T00:00:00Z'),
+          traceId: 'delta-feedback-trace',
+          spanId: null,
+          feedbackSource: 'user',
+          feedbackType: 'thumbs',
+          value: 1,
+          comment: null,
+          experimentId: null,
+          metadata: null,
+        },
+      });
+
+      const page = await waitForValue(
+        () => storage.listFeedback({ filters: { traceId: 'delta-feedback-trace' } }),
+        result => result.feedback.length === 1 && typeof result.deltaCursor === 'string',
+      );
+      expect(page.feedback[0]!.feedbackId).toBe('delta-feedback-1');
+
+      const bootstrap = await storage.listFeedback({ mode: 'delta', filters: { traceId: 'delta-feedback-trace' } });
+      expect(bootstrap.feedback).toEqual([]);
+      expect(bootstrap.deltaCursor).toBeTruthy();
+
+      await storage.createFeedback({
+        feedback: {
+          feedbackId: 'delta-feedback-2',
+          timestamp: new Date('2026-05-06T00:00:01Z'),
+          traceId: 'delta-feedback-trace',
+          spanId: null,
+          feedbackSource: 'user',
+          feedbackType: 'thumbs',
+          value: 0,
+          comment: null,
+          experimentId: null,
+          metadata: null,
+        },
+      });
+
+      const delta = await waitForValue(
+        () =>
+          storage.listFeedback({
+            mode: 'delta',
+            after: bootstrap.deltaCursor!,
+            filters: { traceId: 'delta-feedback-trace' },
+          }),
+        result => result.feedback.length === 1,
+      );
+      expect(delta.feedback.map(feedback => feedback.feedbackId)).toEqual(['delta-feedback-2']);
+      expect(delta.deltaCursor).toBeTruthy();
+    });
+
+    it('uses serial-backed delta tables when generateSerialID is available at runtime', async () => {
+      const client = createClient({
+        url: process.env.CLICKHOUSE_URL || 'http://localhost:8123',
+        username: process.env.CLICKHOUSE_USERNAME || 'default',
+        password: process.env.CLICKHOUSE_PASSWORD || 'password',
+      });
+      const result = await client.query({
+        query: `
+          SELECT create_table_query
+          FROM system.tables
+          WHERE database = currentDatabase()
+            AND name = 'mastra_mv_log_events_delta'
+        `,
+        format: 'JSONEachRow',
+      });
+      const rows = (await result.json()) as Array<{ create_table_query?: string }>;
+      const ddl = rows[0]?.create_table_query ?? '';
+      await client.close();
+
+      expect(ddl).toContain(`generateSerialID('mastra_log_events_delta_cursor')`);
+      expect(ddl).toContain('AS cursorId');
+    });
+
+    it('builds serial-backed delta DDL when explicitly requested', () => {
+      const serialDdl = [...buildAllTableDDL(), ...buildAllMvDDL('serial')].join('\n');
+      const fallbackDdl = [...buildAllTableDDL(), ...buildAllMvDDL('fallback')].join('\n');
+
+      expect(serialDdl).toContain(`generateSerialID('mastra_log_events_delta_cursor')`);
+      expect(serialDdl).toContain(`generateSerialID('mastra_trace_roots_delta_cursor')`);
+      expect(fallbackDdl).toContain('farmFingerprint64(');
+      expect(fallbackDdl).not.toContain('generateSerialID(');
+    });
+
+    it('supports fallback-mode delta polling for traces when forced', async () => {
+      await withFallbackStorage(async fallbackStorage => {
+        await fallbackStorage.createSpan({
+          span: {
+            traceId: 'fallback-trace-1',
+            spanId: 'fallback-trace-root-1',
+            parentSpanId: null,
+            name: 'fallback-trace-root',
+            spanType: SpanType.AGENT_RUN,
+            isEvent: false,
+            entityType: EntityType.AGENT,
+            entityId: 'fallback-trace-agent',
+            entityName: 'fallback-trace-agent',
+            userId: null,
+            organizationId: null,
+            resourceId: null,
+            runId: null,
+            sessionId: null,
+            threadId: null,
+            requestId: null,
+            environment: 'fallback',
+            source: null,
+            serviceName: null,
+            scope: null,
+            attributes: null,
+            metadata: null,
+            tags: null,
+            links: null,
+            input: null,
+            output: null,
+            error: null,
+            startedAt: new Date('2026-05-08T00:00:00Z'),
+            endedAt: new Date('2026-05-08T00:00:01Z'),
+          },
+        });
+
+        const page = await waitForValue(
+          () => fallbackStorage.listTraces({ filters: { entityName: 'fallback-trace-agent' } }),
+          result => result.spans.length === 1 && typeof result.deltaCursor === 'string',
+        );
+
+        await fallbackStorage.createSpan({
+          span: {
+            traceId: 'fallback-trace-2',
+            spanId: 'fallback-trace-root-2',
+            parentSpanId: null,
+            name: 'fallback-trace-root',
+            spanType: SpanType.AGENT_RUN,
+            isEvent: false,
+            entityType: EntityType.AGENT,
+            entityId: 'fallback-trace-agent',
+            entityName: 'fallback-trace-agent',
+            userId: null,
+            organizationId: null,
+            resourceId: null,
+            runId: null,
+            sessionId: null,
+            threadId: null,
+            requestId: null,
+            environment: 'fallback',
+            source: null,
+            serviceName: null,
+            scope: null,
+            attributes: null,
+            metadata: null,
+            tags: null,
+            links: null,
+            input: null,
+            output: null,
+            error: null,
+            startedAt: new Date('2026-05-08T00:00:02Z'),
+            endedAt: new Date('2026-05-08T00:00:03Z'),
+          },
+        });
+
+        const delta = await waitForValue(
+          () =>
+            fallbackStorage.listTraces({
+              mode: 'delta',
+              after: page.deltaCursor!,
+              filters: { entityName: 'fallback-trace-agent' },
+            }),
+          result => result.spans.length === 1,
+        );
+        expect(delta.spans.map(span => span.traceId)).toEqual(['fallback-trace-2']);
+      });
+    });
+
+    it('supports fallback-mode delta polling for branches when forced', async () => {
+      await withFallbackStorage(async fallbackStorage => {
+        await fallbackStorage.batchCreateSpans({
+          records: [
+            {
+              traceId: 'fallback-branch-trace-1',
+              spanId: 'fallback-branch-root-1',
+              parentSpanId: null,
+              name: 'root',
+              spanType: SpanType.WORKFLOW_RUN,
+              isEvent: false,
+              entityType: EntityType.WORKFLOW_RUN,
+              entityId: 'fallback-wf',
+              entityName: 'fallback-wf',
+              userId: null,
+              organizationId: null,
+              resourceId: null,
+              runId: null,
+              sessionId: null,
+              threadId: null,
+              requestId: null,
+              environment: null,
+              source: null,
+              serviceName: null,
+              scope: null,
+              attributes: null,
+              metadata: null,
+              tags: null,
+              links: null,
+              input: null,
+              output: null,
+              error: null,
+              startedAt: new Date('2026-05-09T00:00:00Z'),
+              endedAt: new Date('2026-05-09T00:00:01Z'),
+            },
+            {
+              traceId: 'fallback-branch-trace-1',
+              spanId: 'fallback-branch-anchor-1',
+              parentSpanId: 'fallback-branch-root-1',
+              name: 'observer',
+              spanType: SpanType.AGENT_RUN,
+              isEvent: false,
+              entityType: EntityType.AGENT,
+              entityId: 'fallback-branch-agent',
+              entityName: 'fallback-branch-agent',
+              userId: null,
+              organizationId: null,
+              resourceId: null,
+              runId: null,
+              sessionId: null,
+              threadId: null,
+              requestId: null,
+              environment: null,
+              source: null,
+              serviceName: null,
+              scope: null,
+              attributes: null,
+              metadata: null,
+              tags: null,
+              links: null,
+              input: null,
+              output: null,
+              error: null,
+              startedAt: new Date('2026-05-09T00:00:00.500Z'),
+              endedAt: new Date('2026-05-09T00:00:00.800Z'),
+            },
+          ],
+        });
+
+        const page = await waitForValue(
+          () => fallbackStorage.listBranches({ filters: { entityName: 'fallback-branch-agent' } }),
+          result => result.branches.length === 1 && typeof result.deltaCursor === 'string',
+        );
+
+        await fallbackStorage.batchCreateSpans({
+          records: [
+            {
+              traceId: 'fallback-branch-trace-2',
+              spanId: 'fallback-branch-root-2',
+              parentSpanId: null,
+              name: 'root',
+              spanType: SpanType.WORKFLOW_RUN,
+              isEvent: false,
+              entityType: EntityType.WORKFLOW_RUN,
+              entityId: 'fallback-wf',
+              entityName: 'fallback-wf',
+              userId: null,
+              organizationId: null,
+              resourceId: null,
+              runId: null,
+              sessionId: null,
+              threadId: null,
+              requestId: null,
+              environment: null,
+              source: null,
+              serviceName: null,
+              scope: null,
+              attributes: null,
+              metadata: null,
+              tags: null,
+              links: null,
+              input: null,
+              output: null,
+              error: null,
+              startedAt: new Date('2026-05-09T00:00:02Z'),
+              endedAt: new Date('2026-05-09T00:00:03Z'),
+            },
+            {
+              traceId: 'fallback-branch-trace-2',
+              spanId: 'fallback-branch-anchor-2',
+              parentSpanId: 'fallback-branch-root-2',
+              name: 'observer',
+              spanType: SpanType.AGENT_RUN,
+              isEvent: false,
+              entityType: EntityType.AGENT,
+              entityId: 'fallback-branch-agent',
+              entityName: 'fallback-branch-agent',
+              userId: null,
+              organizationId: null,
+              resourceId: null,
+              runId: null,
+              sessionId: null,
+              threadId: null,
+              requestId: null,
+              environment: null,
+              source: null,
+              serviceName: null,
+              scope: null,
+              attributes: null,
+              metadata: null,
+              tags: null,
+              links: null,
+              input: null,
+              output: null,
+              error: null,
+              startedAt: new Date('2026-05-09T00:00:02.500Z'),
+              endedAt: new Date('2026-05-09T00:00:02.800Z'),
+            },
+          ],
+        });
+
+        const delta = await waitForValue(
+          () =>
+            fallbackStorage.listBranches({
+              mode: 'delta',
+              after: page.deltaCursor!,
+              filters: { entityName: 'fallback-branch-agent' },
+            }),
+          result => result.branches.length === 1,
+        );
+        expect(delta.branches.map(branch => branch.traceId)).toEqual(['fallback-branch-trace-2']);
+      });
+    });
+
+    it('supports fallback-mode delta polling for logs when forced', async () => {
+      await withFallbackStorage(async fallbackStorage => {
+        await fallbackStorage.batchCreateLogs({
+          logs: [
+            {
+              logId: 'fallback-log-1',
+              timestamp: new Date('2026-05-10T00:00:00Z'),
+              level: 'info',
+              message: 'fallback log 1',
+              data: null,
+              traceId: 'fallback-log-trace',
+              metadata: null,
+            },
+          ],
+        });
+
+        const page = await waitForValue(
+          () => fallbackStorage.listLogs({ filters: { traceId: 'fallback-log-trace' } }),
+          result => result.logs.length === 1 && typeof result.deltaCursor === 'string',
+        );
+
+        await fallbackStorage.batchCreateLogs({
+          logs: [
+            {
+              logId: 'fallback-log-2',
+              timestamp: new Date('2026-05-10T00:00:01Z'),
+              level: 'info',
+              message: 'fallback log 2',
+              data: null,
+              traceId: 'fallback-log-trace',
+              metadata: null,
+            },
+          ],
+        });
+
+        const delta = await waitForValue(
+          () =>
+            fallbackStorage.listLogs({
+              mode: 'delta',
+              after: page.deltaCursor!,
+              filters: { traceId: 'fallback-log-trace' },
+            }),
+          result => result.logs.length === 1,
+        );
+        expect(delta.logs.map(log => log.logId)).toEqual(['fallback-log-2']);
+      });
+    });
+
+    it('keeps using fallback mode after reinit on a Keeper-enabled server when fallback delta tables already exist', async () => {
+      const fallbackStorage = new ObservabilityStorageClickhouseVNext({
+        url: process.env.CLICKHOUSE_URL || 'http://localhost:8123',
+        username: process.env.CLICKHOUSE_USERNAME || 'default',
+        password: process.env.CLICKHOUSE_PASSWORD || 'password',
+        deltaCursorStrategy: 'fallback',
+      });
+      await fallbackStorage.init();
+      await fallbackStorage.dangerouslyClearAll();
+
+      try {
+        await fallbackStorage.batchCreateLogs({
+          logs: [
+            {
+              logId: 'fallback-upgrade-log-1',
+              timestamp: new Date('2026-05-11T00:00:00Z'),
+              level: 'info',
+              message: 'fallback upgrade log 1',
+              data: null,
+              traceId: 'fallback-upgrade-trace',
+              metadata: null,
+            },
+          ],
+        });
+
+        const page = await waitForValue(
+          () => fallbackStorage.listLogs({ filters: { traceId: 'fallback-upgrade-trace' } }),
+          result => result.logs.length === 1 && typeof result.deltaCursor === 'string',
+        );
+
+        const defaultStorage = new ObservabilityStorageClickhouseVNext({
+          url: process.env.CLICKHOUSE_URL || 'http://localhost:8123',
+          username: process.env.CLICKHOUSE_USERNAME || 'default',
+          password: process.env.CLICKHOUSE_PASSWORD || 'password',
+        });
+        await defaultStorage.init();
+
+        await defaultStorage.batchCreateLogs({
+          logs: [
+            {
+              logId: 'fallback-upgrade-log-2',
+              timestamp: new Date('2026-05-11T00:00:01Z'),
+              level: 'info',
+              message: 'fallback upgrade log 2',
+              data: null,
+              traceId: 'fallback-upgrade-trace',
+              metadata: null,
+            },
+          ],
+        });
+
+        const delta = await waitForValue(
+          () =>
+            defaultStorage.listLogs({
+              mode: 'delta',
+              after: page.deltaCursor!,
+              filters: { traceId: 'fallback-upgrade-trace' },
+            }),
+          result => result.logs.length === 1,
+        );
+        expect(delta.logs.map(log => log.logId)).toEqual(['fallback-upgrade-log-2']);
+      } finally {
+        await fallbackStorage.dangerouslyClearAll();
+      }
     });
   });
 
@@ -258,6 +1213,457 @@ describe('ObservabilityStorageClickhouseVNext', () => {
   });
 
   // ==========================================================================
+  // Trace branches
+  // ==========================================================================
+
+  describe('branches', () => {
+    /**
+     * Wait until the materialized view has populated `mastra_trace_branches` with
+     * the expected number of rows. The MV is incremental but ClickHouse is
+     * eventually-consistent w.r.t. parts merging; in practice rows appear
+     * within a single insert flush, but the retry loop guards against CI flakes.
+     */
+    async function waitForBranches(expected: number, timeoutMs = 5000): Promise<number> {
+      const deadline = Date.now() + timeoutMs;
+      let last = -1;
+      while (Date.now() < deadline) {
+        const result = await storage.listBranches({ pagination: { perPage: 100 } });
+        last = result.branches.length;
+        if (last >= expected) return last;
+        await new Promise(r => setTimeout(r, 100));
+      }
+      return last;
+    }
+
+    it('surfaces nested branches that listTraces would miss', async () => {
+      // orderWorkflow → Observer (nested AGENT_RUN, twice) and a tool call.
+      // Plus a model_step which must NOT appear (sub-operation).
+      await storage.batchCreateSpans({
+        records: [
+          {
+            traceId: 'inv-trace-1',
+            spanId: 'root',
+            parentSpanId: null,
+            name: 'orderWorkflow',
+            spanType: SpanType.WORKFLOW_RUN,
+            isEvent: false,
+            entityType: EntityType.WORKFLOW_RUN,
+            entityId: 'wf-1',
+            entityName: 'orderWorkflow',
+            userId: null,
+            organizationId: null,
+            resourceId: null,
+            runId: null,
+            sessionId: null,
+            threadId: null,
+            requestId: null,
+            environment: null,
+            source: null,
+            serviceName: null,
+            scope: null,
+            attributes: null,
+            metadata: null,
+            tags: [],
+            links: null,
+            input: null,
+            output: null,
+            error: null,
+            startedAt: new Date('2026-04-01T12:00:00Z'),
+            endedAt: new Date('2026-04-01T12:00:10Z'),
+          },
+          {
+            traceId: 'inv-trace-1',
+            spanId: 'observer-1',
+            parentSpanId: 'root',
+            name: 'Observer',
+            spanType: SpanType.AGENT_RUN,
+            isEvent: false,
+            entityType: EntityType.AGENT,
+            entityId: 'agent-observer',
+            entityName: 'Observer',
+            userId: null,
+            organizationId: null,
+            resourceId: null,
+            runId: null,
+            sessionId: null,
+            threadId: null,
+            requestId: null,
+            environment: null,
+            source: null,
+            serviceName: null,
+            scope: null,
+            attributes: null,
+            metadata: null,
+            tags: [],
+            links: null,
+            input: null,
+            output: null,
+            error: null,
+            startedAt: new Date('2026-04-01T12:00:01Z'),
+            endedAt: new Date('2026-04-01T12:00:03Z'),
+          },
+          {
+            traceId: 'inv-trace-1',
+            spanId: 'observer-2',
+            parentSpanId: 'root',
+            name: 'Observer',
+            spanType: SpanType.AGENT_RUN,
+            isEvent: false,
+            entityType: EntityType.AGENT,
+            entityId: 'agent-observer',
+            entityName: 'Observer',
+            userId: null,
+            organizationId: null,
+            resourceId: null,
+            runId: null,
+            sessionId: null,
+            threadId: null,
+            requestId: null,
+            environment: null,
+            source: null,
+            serviceName: null,
+            scope: null,
+            attributes: null,
+            metadata: null,
+            tags: [],
+            links: null,
+            input: null,
+            output: null,
+            error: null,
+            startedAt: new Date('2026-04-01T12:00:05Z'),
+            endedAt: new Date('2026-04-01T12:00:07Z'),
+          },
+          {
+            traceId: 'inv-trace-1',
+            spanId: 'search-1',
+            parentSpanId: 'observer-1',
+            name: 'web_search',
+            spanType: SpanType.TOOL_CALL,
+            isEvent: false,
+            entityType: EntityType.TOOL,
+            entityId: 'tool-web-search',
+            entityName: 'web_search',
+            userId: null,
+            organizationId: null,
+            resourceId: null,
+            runId: null,
+            sessionId: null,
+            threadId: null,
+            requestId: null,
+            environment: null,
+            source: null,
+            serviceName: null,
+            scope: null,
+            attributes: null,
+            metadata: null,
+            tags: [],
+            links: null,
+            input: null,
+            output: null,
+            error: null,
+            startedAt: new Date('2026-04-01T12:00:02Z'),
+            endedAt: new Date('2026-04-01T12:00:02.500Z'),
+          },
+          {
+            traceId: 'inv-trace-1',
+            spanId: 'model-step-1',
+            parentSpanId: 'observer-1',
+            name: 'gpt-4-call',
+            spanType: SpanType.MODEL_STEP, // sub-operation: must NOT appear
+            isEvent: false,
+            entityType: null,
+            entityId: null,
+            entityName: 'gpt-4',
+            userId: null,
+            organizationId: null,
+            resourceId: null,
+            runId: null,
+            sessionId: null,
+            threadId: null,
+            requestId: null,
+            environment: null,
+            source: null,
+            serviceName: null,
+            scope: null,
+            attributes: null,
+            metadata: null,
+            tags: [],
+            links: null,
+            input: null,
+            output: null,
+            error: null,
+            startedAt: new Date('2026-04-01T12:00:02.250Z'),
+            endedAt: new Date('2026-04-01T12:00:02.400Z'),
+          },
+        ],
+      });
+
+      // Should populate: 1 workflow_run + 2 agent_run + 1 tool_call = 4.
+      // The model_step is excluded by the MV WHERE clause.
+      const populated = await waitForBranches(4);
+      expect(populated).toBe(4);
+
+      // listTraces({ entityName: 'Observer' }) returns nothing since Observer
+      // is never the root span -- this is the gap listBranches closes.
+      const traces = await storage.listTraces({ filters: { entityName: 'Observer' } });
+      expect(traces.spans).toHaveLength(0);
+
+      const observerBranches = await storage.listBranches({
+        filters: { entityName: 'Observer' },
+      });
+      expect(observerBranches.branches).toHaveLength(2);
+      expect(observerBranches.branches.every(i => i.entityName === 'Observer')).toBe(true);
+    });
+
+    it('narrows by spanType and respects pagination', async () => {
+      const baseStartedAt = new Date('2026-04-02T10:00:00Z');
+      const records = Array.from({ length: 5 }, (_, i) => ({
+        traceId: `pag-trace-${i}`,
+        spanId: `tool-${i}`,
+        parentSpanId: null,
+        name: `tool-${i}`,
+        spanType: SpanType.TOOL_CALL,
+        isEvent: false,
+        entityType: EntityType.TOOL,
+        entityId: 'web_search',
+        entityName: 'web_search',
+        userId: null,
+        organizationId: null,
+        resourceId: null,
+        runId: null,
+        sessionId: null,
+        threadId: null,
+        requestId: null,
+        environment: null,
+        source: null,
+        serviceName: null,
+        scope: null,
+        attributes: null,
+        metadata: null,
+        tags: [],
+        links: null,
+        input: null,
+        output: null,
+        error: null,
+        startedAt: new Date(baseStartedAt.getTime() + i * 1000),
+        endedAt: new Date(baseStartedAt.getTime() + i * 1000 + 500),
+      }));
+      await storage.batchCreateSpans({ records });
+
+      await waitForBranches(5);
+
+      const onlyTools = await storage.listBranches({
+        filters: { spanType: SpanType.TOOL_CALL, entityName: 'web_search' },
+        pagination: { page: 0, perPage: 2 },
+      });
+      expect(onlyTools.branches).toHaveLength(2);
+      expect(onlyTools.pagination.total).toBe(5);
+      expect(onlyTools.pagination.hasMore).toBe(true);
+
+      const page2 = await storage.listBranches({
+        filters: { spanType: SpanType.TOOL_CALL, entityName: 'web_search' },
+        pagination: { page: 2, perPage: 2 },
+      });
+      expect(page2.branches).toHaveLength(1);
+      expect(page2.pagination.hasMore).toBe(false);
+    });
+  });
+
+  // ==========================================================================
+  // getSpans (batch by spanId)
+  // ==========================================================================
+
+  describe('getSpans', () => {
+    it('fetches a subset of spans within a trace by spanId', async () => {
+      const baseSpan = {
+        userId: null,
+        organizationId: null,
+        resourceId: null,
+        runId: null,
+        sessionId: null,
+        threadId: null,
+        requestId: null,
+        environment: null,
+        source: null,
+        serviceName: null,
+        scope: null,
+        attributes: null,
+        metadata: null,
+        tags: [],
+        links: null,
+        input: null,
+        output: null,
+        error: null,
+        isEvent: false,
+        entityType: null,
+        entityId: null,
+        entityName: null,
+      } as const;
+      await storage.batchCreateSpans({
+        records: [
+          {
+            ...baseSpan,
+            traceId: 'gs-1',
+            spanId: 'a',
+            parentSpanId: null,
+            name: 'a',
+            spanType: SpanType.AGENT_RUN,
+            input: { prompt: 'hi' }, // verify heavy fields round-trip
+            startedAt: new Date('2026-04-04T00:00:00Z'),
+            endedAt: new Date('2026-04-04T00:00:01Z'),
+          },
+          {
+            ...baseSpan,
+            traceId: 'gs-1',
+            spanId: 'b',
+            parentSpanId: 'a',
+            name: 'b',
+            spanType: SpanType.TOOL_CALL,
+            startedAt: new Date('2026-04-04T00:00:02Z'),
+            endedAt: new Date('2026-04-04T00:00:03Z'),
+          },
+          {
+            ...baseSpan,
+            traceId: 'gs-1',
+            spanId: 'c',
+            parentSpanId: 'a',
+            name: 'c',
+            spanType: SpanType.TOOL_CALL,
+            startedAt: new Date('2026-04-04T00:00:04Z'),
+            endedAt: new Date('2026-04-04T00:00:05Z'),
+          },
+        ],
+      });
+
+      const result = await storage.getSpans({ traceId: 'gs-1', spanIds: ['a', 'c'] });
+      expect(result.traceId).toBe('gs-1');
+      const ids = result.spans.map(s => s.spanId).sort();
+      expect(ids).toEqual(['a', 'c']);
+
+      // Heavy fields are populated (this is the difference from getStructure).
+      const a = result.spans.find(s => s.spanId === 'a')!;
+      expect(a.input).toEqual({ prompt: 'hi' });
+    });
+
+    it('returns empty spans array when no spanIds match', async () => {
+      const result = await storage.getSpans({ traceId: 'no-such-trace', spanIds: ['x'] });
+      expect(result.spans).toEqual([]);
+    });
+  });
+
+  // ==========================================================================
+  // getBranch
+  //
+  // ClickHouse v-next implements both getStructure (via getTraceLight alias)
+  // and getSpans, so getBranch goes through the optimized two-step path in
+  // base.ts: structure walk → batch span fetch (no full-trace pull).
+  // ==========================================================================
+
+  describe('getBranch', () => {
+    beforeEach(async () => {
+      const baseSpan = {
+        userId: null,
+        organizationId: null,
+        resourceId: null,
+        runId: null,
+        sessionId: null,
+        threadId: null,
+        requestId: null,
+        environment: null,
+        source: null,
+        serviceName: null,
+        scope: null,
+        attributes: null,
+        metadata: null,
+        tags: [],
+        links: null,
+        input: null,
+        output: null,
+        error: null,
+        isEvent: false,
+        entityType: null,
+        entityId: null,
+        entityName: null,
+      } as const;
+      await storage.batchCreateSpans({
+        records: [
+          {
+            ...baseSpan,
+            traceId: 'br-1',
+            spanId: 'root',
+            parentSpanId: null,
+            name: 'root',
+            spanType: SpanType.WORKFLOW_RUN,
+            startedAt: new Date('2026-04-03T00:00:00Z'),
+            endedAt: new Date('2026-04-03T00:00:10Z'),
+          },
+          {
+            ...baseSpan,
+            traceId: 'br-1',
+            spanId: 'A',
+            parentSpanId: 'root',
+            name: 'A',
+            spanType: SpanType.AGENT_RUN,
+            startedAt: new Date('2026-04-03T00:00:01Z'),
+            endedAt: new Date('2026-04-03T00:00:05Z'),
+          },
+          {
+            ...baseSpan,
+            traceId: 'br-1',
+            spanId: 'A1',
+            parentSpanId: 'A',
+            name: 'A1',
+            spanType: SpanType.TOOL_CALL,
+            startedAt: new Date('2026-04-03T00:00:02Z'),
+            endedAt: new Date('2026-04-03T00:00:03Z'),
+          },
+          {
+            ...baseSpan,
+            traceId: 'br-1',
+            spanId: 'A1a',
+            parentSpanId: 'A1',
+            name: 'A1a',
+            spanType: SpanType.MODEL_STEP,
+            startedAt: new Date('2026-04-03T00:00:02.500Z'),
+            endedAt: new Date('2026-04-03T00:00:02.800Z'),
+          },
+          {
+            ...baseSpan,
+            traceId: 'br-1',
+            spanId: 'B',
+            parentSpanId: 'root',
+            name: 'B',
+            spanType: SpanType.AGENT_RUN,
+            startedAt: new Date('2026-04-03T00:00:06Z'),
+            endedAt: new Date('2026-04-03T00:00:09Z'),
+          },
+        ],
+      });
+    });
+
+    it('returns the full subtree by default', async () => {
+      const branch = await storage.getBranch({ traceId: 'br-1', spanId: 'A' });
+      expect(branch).not.toBeNull();
+      expect(branch!.spans.map(s => s.spanId).sort()).toEqual(['A', 'A1', 'A1a']);
+    });
+
+    it('depth=1 returns only the anchor and its immediate children', async () => {
+      const branch = await storage.getBranch({ traceId: 'br-1', spanId: 'A', depth: 1 });
+      expect(branch!.spans.map(s => s.spanId).sort()).toEqual(['A', 'A1']);
+    });
+
+    it('depth=0 returns just the anchor', async () => {
+      const branch = await storage.getBranch({ traceId: 'br-1', spanId: 'A', depth: 0 });
+      expect(branch!.spans.map(s => s.spanId)).toEqual(['A']);
+    });
+
+    it('returns null when the anchor span is not in the trace', async () => {
+      const branch = await storage.getBranch({ traceId: 'br-1', spanId: 'missing' });
+      expect(branch).toBeNull();
+    });
+  });
+
+  // ==========================================================================
   // Logs
   // ==========================================================================
 
@@ -266,6 +1672,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       await storage.batchCreateLogs({
         logs: [
           {
+            logId: 'log-test-1',
             timestamp: new Date(),
             level: 'info',
             message: 'Test log message',
@@ -279,6 +1686,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             metadata: null,
           },
           {
+            logId: 'log-test-2',
             timestamp: new Date(),
             level: 'error',
             message: 'Error occurred',
@@ -311,6 +1719,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       await storage.batchCreateMetrics({
         metrics: [
           {
+            metricId: 'metric-test-1',
             timestamp: new Date('2026-01-01T00:00:00Z'),
             name: 'mastra_agent_duration_ms',
             value: 100,
@@ -324,6 +1733,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             entityName: 'weatherAgent',
           },
           {
+            metricId: 'metric-test-2',
             timestamp: new Date('2026-01-01T00:00:05Z'),
             name: 'mastra_agent_duration_ms',
             value: 200,
@@ -337,6 +1747,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             entityName: 'weatherAgent',
           },
           {
+            metricId: 'metric-test-3',
             timestamp: new Date('2026-01-01T00:00:10Z'),
             name: 'mastra_agent_duration_ms',
             value: 500,
@@ -350,6 +1761,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             entityName: 'codeAgent',
           },
           {
+            metricId: 'metric-test-4',
             timestamp: new Date('2026-01-01T01:00:00Z'),
             name: 'mastra_tool_calls_started',
             value: 1,
@@ -452,6 +1864,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       await storage.batchCreateMetrics({
         metrics: [
           {
+            metricId: 'metric-test-5',
             timestamp: new Date('2026-01-01T00:00:20Z'),
             name: 'mastra_agent_duration_ms',
             value: 300,
@@ -460,6 +1873,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             entityName: 'weatherAgent',
           },
           {
+            metricId: 'metric-test-6',
             timestamp: new Date('2026-01-01T00:00:25Z'),
             name: 'mastra_agent_duration_ms',
             value: 400,
@@ -505,6 +1919,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       await storage.batchCreateMetrics({
         metrics: [
           {
+            metricId: 'metric-test-5',
             timestamp: new Date('2026-01-01T02:00:00Z'),
             name: 'mastra_collision_metric',
             value: 10,
@@ -513,6 +1928,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             entityName: 'search',
           },
           {
+            metricId: 'metric-test-6',
             timestamp: new Date('2026-01-01T02:00:00Z'),
             name: 'mastra_collision_metric',
             value: 20,
@@ -543,6 +1959,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       await storage.batchCreateMetrics({
         metrics: [
           {
+            metricId: 'metric-test-5',
             timestamp: new Date('2026-01-01T00:00:15Z'),
             name: 'mastra_agent_duration_ms',
             value: 50,
@@ -572,6 +1989,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       await storage.batchCreateMetrics({
         metrics: [
           {
+            metricId: 'metric-test-5',
             timestamp: new Date('2026-01-01T00:00:15Z'),
             name: 'mastra_agent_duration_ms',
             value: 50,
@@ -639,9 +2057,30 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('listLogs defaults to timestamp DESC', async () => {
       await storage.batchCreateLogs({
         logs: [
-          { timestamp: new Date('2026-01-01T00:00:01Z'), level: 'info', message: 'first', data: null, metadata: null },
-          { timestamp: new Date('2026-01-01T00:00:03Z'), level: 'info', message: 'third', data: null, metadata: null },
-          { timestamp: new Date('2026-01-01T00:00:02Z'), level: 'info', message: 'second', data: null, metadata: null },
+          {
+            logId: 'log-test-1',
+            timestamp: new Date('2026-01-01T00:00:01Z'),
+            level: 'info',
+            message: 'first',
+            data: null,
+            metadata: null,
+          },
+          {
+            logId: 'log-test-2',
+            timestamp: new Date('2026-01-01T00:00:03Z'),
+            level: 'info',
+            message: 'third',
+            data: null,
+            metadata: null,
+          },
+          {
+            logId: 'log-test-3',
+            timestamp: new Date('2026-01-01T00:00:02Z'),
+            level: 'info',
+            message: 'second',
+            data: null,
+            metadata: null,
+          },
         ],
       });
 
@@ -656,9 +2095,27 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('listMetrics defaults to timestamp DESC', async () => {
       await storage.batchCreateMetrics({
         metrics: [
-          { timestamp: new Date('2026-01-01T00:00:01Z'), name: 'order_test', value: 1, labels: {} },
-          { timestamp: new Date('2026-01-01T00:00:03Z'), name: 'order_test', value: 3, labels: {} },
-          { timestamp: new Date('2026-01-01T00:00:02Z'), name: 'order_test', value: 2, labels: {} },
+          {
+            metricId: 'metric-test-1',
+            timestamp: new Date('2026-01-01T00:00:01Z'),
+            name: 'order_test',
+            value: 1,
+            labels: {},
+          },
+          {
+            metricId: 'metric-test-2',
+            timestamp: new Date('2026-01-01T00:00:03Z'),
+            name: 'order_test',
+            value: 3,
+            labels: {},
+          },
+          {
+            metricId: 'metric-test-3',
+            timestamp: new Date('2026-01-01T00:00:02Z'),
+            name: 'order_test',
+            value: 2,
+            labels: {},
+          },
         ],
       });
 
@@ -672,6 +2129,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('listScores defaults to timestamp DESC', async () => {
       await storage.createScore({
         score: {
+          scoreId: 'score-test-1',
           timestamp: new Date('2026-01-01T00:00:01Z'),
           traceId: 'ord-1',
           spanId: null,
@@ -684,6 +2142,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       });
       await storage.createScore({
         score: {
+          scoreId: 'score-test-2',
           timestamp: new Date('2026-01-01T00:00:03Z'),
           traceId: 'ord-3',
           spanId: null,
@@ -696,6 +2155,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       });
       await storage.createScore({
         score: {
+          scoreId: 'score-test-3',
           timestamp: new Date('2026-01-01T00:00:02Z'),
           traceId: 'ord-2',
           spanId: null,
@@ -714,9 +2174,50 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       expect(result.scores[2]!.traceId).toBe('ord-1');
     });
 
+    it('gets a score by id', async () => {
+      await storage.createScore({
+        score: {
+          scoreId: 'score-lookup-1',
+          timestamp: new Date('2026-01-01T00:00:01Z'),
+          traceId: 'lookup-trace-1',
+          spanId: null,
+          scorerId: 'quality',
+          score: 0.8,
+          reason: 'Good answer',
+          experimentId: null,
+          metadata: { entityType: 'agent' },
+        },
+      });
+      await storage.createScore({
+        score: {
+          scoreId: 'score-lookup-2',
+          timestamp: new Date('2026-01-01T00:00:02Z'),
+          traceId: 'lookup-trace-2',
+          spanId: 'lookup-span-2',
+          scorerId: 'factuality',
+          score: 0.9,
+          reason: null,
+          experimentId: null,
+          metadata: null,
+        },
+      });
+
+      const score = await storage.getScoreById('score-lookup-1');
+      expect(score).toEqual(
+        expect.objectContaining({
+          scoreId: 'score-lookup-1',
+          traceId: 'lookup-trace-1',
+          scorerId: 'quality',
+          score: 0.8,
+        }),
+      );
+      expect(await storage.getScoreById('missing-score')).toBeNull();
+    });
+
     it('listFeedback defaults to timestamp DESC', async () => {
       await storage.createFeedback({
         feedback: {
+          feedbackId: 'feedback-test-1',
           timestamp: new Date('2026-01-01T00:00:01Z'),
           traceId: 'fb-ord-1',
           spanId: null,
@@ -732,6 +2233,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       });
       await storage.createFeedback({
         feedback: {
+          feedbackId: 'feedback-test-2',
           timestamp: new Date('2026-01-01T00:00:03Z'),
           traceId: 'fb-ord-3',
           spanId: null,
@@ -747,6 +2249,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       });
       await storage.createFeedback({
         feedback: {
+          feedbackId: 'feedback-test-3',
           timestamp: new Date('2026-01-01T00:00:02Z'),
           traceId: 'fb-ord-2',
           spanId: null,
@@ -885,6 +2388,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
         await storage.batchCreateLogs({
           logs: [
             {
+              logId: 'log-test-1',
               timestamp: new Date('2026-01-01T00:00:00Z'),
               level: 'info',
               message: 'log-A',
@@ -910,6 +2414,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
               metadata: null,
             },
             {
+              logId: 'log-test-2',
               timestamp: new Date('2026-01-01T00:00:05Z'),
               level: 'error',
               message: 'log-B',
@@ -1046,6 +2551,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
         await storage.batchCreateMetrics({
           metrics: [
             {
+              metricId: 'metric-test-1',
               timestamp: new Date('2026-01-01T00:00:00Z'),
               name: 'ft_metric',
               value: 100,
@@ -1070,6 +2576,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
               tags: ['alpha'],
             },
             {
+              metricId: 'metric-test-2',
               timestamp: new Date('2026-01-01T00:00:05Z'),
               name: 'ft_metric',
               value: 200,
@@ -1157,6 +2664,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       beforeEach(async () => {
         await storage.createScore({
           score: {
+            scoreId: 'score-test-1',
             timestamp: new Date('2026-01-01T00:00:00Z'),
             traceId: 'sf-trace-1',
             spanId: 'sf-span-1',
@@ -1170,6 +2678,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
         });
         await storage.createScore({
           score: {
+            scoreId: 'score-test-2',
             timestamp: new Date('2026-01-01T00:00:05Z'),
             traceId: 'sf-trace-2',
             spanId: null,
@@ -1237,6 +2746,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       beforeEach(async () => {
         await storage.createFeedback({
           feedback: {
+            feedbackId: 'feedback-test-1',
             timestamp: new Date('2026-01-01T00:00:00Z'),
             traceId: 'ff-trace-1',
             spanId: 'ff-span-1',
@@ -1253,6 +2763,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
         });
         await storage.createFeedback({
           feedback: {
+            feedbackId: 'feedback-test-2',
             timestamp: new Date('2026-01-01T00:00:05Z'),
             traceId: 'ff-trace-2',
             spanId: null,
@@ -1329,6 +2840,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       await storage.batchCreateMetrics({
         metrics: [
           {
+            metricId: 'metric-test-1',
             timestamp: new Date(),
             name: 'mastra_agent_duration_ms',
             value: 100,
@@ -1340,6 +2852,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             tags: ['metric-tag'],
           },
           {
+            metricId: 'metric-test-2',
             timestamp: new Date(),
             name: 'mastra_tool_calls_started',
             value: 1,
@@ -1356,6 +2869,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       await storage.batchCreateLogs({
         logs: [
           {
+            logId: 'log-test-1',
             timestamp: new Date(),
             level: 'info',
             message: 'discovery-log',
@@ -1487,6 +3001,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('creates and lists scores', async () => {
       await storage.createScore({
         score: {
+          scoreId: 'score-test-1',
           timestamp: new Date(),
           traceId: 'trace-1',
           spanId: null,
@@ -1500,6 +3015,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
 
       await storage.createScore({
         score: {
+          scoreId: 'score-test-2',
           timestamp: new Date(),
           traceId: 'trace-1',
           spanId: 'span-1',
@@ -1524,6 +3040,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('scoreSource round-trips through CH scoreSource column', async () => {
       await storage.createScore({
         score: {
+          scoreId: 'score-test-1',
           timestamp: new Date(),
           traceId: 'trace-score-src',
           spanId: null,
@@ -1545,6 +3062,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('supports nullable traceId for scores at the storage boundary', async () => {
       await storage.createScore({
         score: {
+          scoreId: 'score-test-1',
           timestamp: new Date(),
           traceId: null,
           spanId: null,
@@ -1566,6 +3084,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('filters scores by scoreSource', async () => {
       await storage.createScore({
         score: {
+          scoreId: 'score-test-1',
           timestamp: new Date(),
           traceId: 'trace-ss-1',
           spanId: null,
@@ -1579,6 +3098,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       });
       await storage.createScore({
         score: {
+          scoreId: 'score-test-2',
           timestamp: new Date(),
           traceId: 'trace-ss-2',
           spanId: null,
@@ -1607,6 +3127,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('creates and lists feedback', async () => {
       await storage.createFeedback({
         feedback: {
+          feedbackId: 'feedback-test-1',
           timestamp: new Date(),
           traceId: 'trace-1',
           spanId: null,
@@ -1623,6 +3144,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
 
       await storage.createFeedback({
         feedback: {
+          feedbackId: 'feedback-test-2',
           timestamp: new Date(),
           traceId: 'trace-2',
           spanId: null,
@@ -1652,6 +3174,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('feedbackUserId round-trips through CH userId column', async () => {
       await storage.createFeedback({
         feedback: {
+          feedbackId: 'feedback-test-1',
           timestamp: new Date(),
           traceId: 'trace-fbu',
           spanId: null,
@@ -1675,6 +3198,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('filters feedback by feedbackUserId', async () => {
       await storage.createFeedback({
         feedback: {
+          feedbackId: 'feedback-test-1',
           timestamp: new Date(),
           traceId: 'trace-fbu-f1',
           spanId: null,
@@ -1690,6 +3214,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       });
       await storage.createFeedback({
         feedback: {
+          feedbackId: 'feedback-test-2',
           timestamp: new Date(),
           traceId: 'trace-fbu-f2',
           spanId: null,
@@ -1714,6 +3239,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('feedbackSource round-trips through CH feedbackSource column', async () => {
       await storage.createFeedback({
         feedback: {
+          feedbackId: 'feedback-test-1',
           timestamp: new Date(),
           traceId: 'trace-fbs',
           spanId: null,
@@ -1737,6 +3263,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('supports nullable traceId for feedback at the storage boundary', async () => {
       await storage.createFeedback({
         feedback: {
+          feedbackId: 'feedback-test-1',
           timestamp: new Date(),
           traceId: null,
           spanId: null,
@@ -1760,6 +3287,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('deprecated feedback source alias still writes to feedbackSource column', async () => {
       await storage.createFeedback({
         feedback: {
+          feedbackId: 'feedback-test-1',
           timestamp: new Date(),
           traceId: 'trace-fbs-compat',
           spanId: null,
@@ -1783,6 +3311,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('filters feedback by feedbackSource', async () => {
       await storage.createFeedback({
         feedback: {
+          feedbackId: 'feedback-test-1',
           timestamp: new Date(),
           traceId: 'trace-fbs-f1',
           spanId: null,
@@ -1798,6 +3327,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       });
       await storage.createFeedback({
         feedback: {
+          feedbackId: 'feedback-test-2',
           timestamp: new Date(),
           traceId: 'trace-fbs-f2',
           spanId: null,
@@ -1823,6 +3353,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       await storage.batchCreateFeedback({
         feedbacks: [
           {
+            feedbackId: 'feedback-test-1',
             timestamp: new Date('2026-01-01T00:00:00Z'),
             traceId: 'batch-trace-1',
             spanId: null,
@@ -1836,6 +3367,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             metadata: null,
           },
           {
+            feedbackId: 'feedback-test-2',
             timestamp: new Date('2026-01-01T00:00:01Z'),
             traceId: 'batch-trace-2',
             spanId: 'span-2',
@@ -1849,6 +3381,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             metadata: { category: 'quality' },
           },
           {
+            feedbackId: 'feedback-test-3',
             timestamp: new Date('2026-01-01T00:00:02Z'),
             traceId: 'batch-trace-3',
             spanId: null,
@@ -2779,6 +4312,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       await storage.batchCreateMetrics({
         metrics: [
           {
+            metricId: 'metric-test-1',
             timestamp: new Date('2026-01-01T00:00:00Z'),
             name: 'norm_labels_metric',
             value: 1,
@@ -2844,6 +4378,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       await storage.batchCreateLogs({
         logs: [
           {
+            logId: 'log-test-1',
             timestamp: new Date(),
             level: 'info',
             message: 'exec-source-test',
@@ -2863,6 +4398,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       await storage.batchCreateMetrics({
         metrics: [
           {
+            metricId: 'metric-test-1',
             timestamp: new Date(),
             name: 'exec_source_metric',
             value: 1,
@@ -2930,6 +4466,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       await storage.batchCreateScores({
         scores: [
           {
+            scoreId: 'score-test-1',
             timestamp: new Date('2026-01-01T00:00:00Z'),
             traceId: 'olap-s-1',
             spanId: null,
@@ -2944,6 +4481,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             metadata: null,
           },
           {
+            scoreId: 'score-test-2',
             timestamp: new Date('2026-01-01T00:00:05Z'),
             traceId: 'olap-s-2',
             spanId: null,
@@ -2958,6 +4496,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             metadata: null,
           },
           {
+            scoreId: 'score-test-3',
             timestamp: new Date('2026-01-01T00:00:10Z'),
             traceId: 'olap-s-3',
             spanId: null,
@@ -2972,6 +4511,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             metadata: null,
           },
           {
+            scoreId: 'score-test-4',
             timestamp: new Date('2026-01-01T01:00:00Z'),
             traceId: 'olap-s-4',
             spanId: null,
@@ -3102,6 +4642,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       await storage.batchCreateFeedback({
         feedbacks: [
           {
+            feedbackId: 'feedback-test-1',
             timestamp: new Date('2026-01-01T00:00:00Z'),
             traceId: 'olap-f-1',
             spanId: null,
@@ -3115,6 +4656,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             metadata: null,
           },
           {
+            feedbackId: 'feedback-test-2',
             timestamp: new Date('2026-01-01T00:00:05Z'),
             traceId: 'olap-f-2',
             spanId: null,
@@ -3128,6 +4670,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             metadata: null,
           },
           {
+            feedbackId: 'feedback-test-3',
             timestamp: new Date('2026-01-01T00:00:10Z'),
             traceId: 'olap-f-3',
             spanId: null,
@@ -3141,6 +4684,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             metadata: null,
           },
           {
+            feedbackId: 'feedback-test-4',
             timestamp: new Date('2026-01-01T01:00:00Z'),
             traceId: 'olap-f-4',
             spanId: null,
@@ -3151,6 +4695,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
             metadata: null,
           },
           {
+            feedbackId: 'feedback-test-5',
             timestamp: new Date('2026-01-01T01:00:05Z'),
             traceId: 'olap-f-5',
             spanId: null,
@@ -3282,6 +4827,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('score with full context fields round-trips', async () => {
       await storage.createScore({
         score: {
+          scoreId: 'score-test-1',
           timestamp: new Date('2026-01-01T00:00:00Z'),
           traceId: 'ctx-score-1',
           spanId: 'ctx-span-1',
@@ -3351,6 +4897,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
     it('feedback with full context fields round-trips', async () => {
       await storage.createFeedback({
         feedback: {
+          feedbackId: 'feedback-test-1',
           timestamp: new Date('2026-01-01T00:00:00Z'),
           traceId: 'ctx-fb-1',
           spanId: 'ctx-fb-span-1',
@@ -3432,11 +4979,12 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       expect(buildRetentionDDL({})).toEqual([]);
     });
 
-    it('buildRetentionDDL generates tracing TTL for both span_events and trace_roots', () => {
+    it('buildRetentionDDL generates tracing TTL for span_events, trace_roots, and trace_branches', () => {
       const stmts = buildRetentionDDL({ tracing: 30 });
-      expect(stmts).toHaveLength(2);
+      expect(stmts).toHaveLength(3);
       expect(stmts[0]).toBe('ALTER TABLE mastra_span_events MODIFY TTL endedAt + INTERVAL 30 DAY');
       expect(stmts[1]).toBe('ALTER TABLE mastra_trace_roots MODIFY TTL endedAt + INTERVAL 30 DAY');
+      expect(stmts[2]).toBe('ALTER TABLE mastra_trace_branches MODIFY TTL endedAt + INTERVAL 30 DAY');
     });
 
     it('buildRetentionDDL generates per-signal TTL statements', () => {
@@ -3466,6 +5014,47 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       expect(stmts[0]).toBe('ALTER TABLE mastra_log_events MODIFY TTL timestamp + INTERVAL 7 DAY');
     });
 
+    // --- Unit tests for buildRetentionEntries ---
+
+    it('buildRetentionEntries returns structured entries whose sql matches buildRetentionDDL', () => {
+      const config = { tracing: 30, logs: 7, metrics: 14 };
+      const entries = buildRetentionEntries(config);
+      const ddl = buildRetentionDDL(config);
+      expect(entries).toHaveLength(ddl.length);
+      expect(entries.map(e => e.sql)).toEqual(ddl);
+      for (const entry of entries) {
+        expect(entry.sql).toContain(`ALTER TABLE ${entry.table}`);
+        expect(entry.sql).toContain(`${entry.column} + INTERVAL ${entry.days} DAY`);
+      }
+    });
+
+    // --- Unit tests for parseTtlExpression ---
+
+    it('parseTtlExpression parses normalized toIntervalDay form', () => {
+      expect(parseTtlExpression('TTL endedAt + toIntervalDay(30)')).toEqual({ column: 'endedAt', days: 30 });
+    });
+
+    it('parseTtlExpression parses INTERVAL N DAY form', () => {
+      expect(parseTtlExpression('TTL timestamp + INTERVAL 7 DAY')).toEqual({ column: 'timestamp', days: 7 });
+    });
+
+    it('parseTtlExpression extracts TTL from a full CREATE TABLE statement', () => {
+      const createTable = `CREATE TABLE mastra_span_events (...) ENGINE = ReplacingMergeTree PARTITION BY toDate(endedAt) ORDER BY (traceId) TTL endedAt + toIntervalDay(30) SETTINGS index_granularity = 8192`;
+      expect(parseTtlExpression(createTable)).toEqual({ column: 'endedAt', days: 30 });
+    });
+
+    it('parseTtlExpression handles backtick-quoted column identifiers', () => {
+      // ClickHouse's `system.tables.create_table_query` often wraps identifiers
+      // in backticks, e.g. `TTL `endedAt` + toIntervalDay(30)`.
+      expect(parseTtlExpression('TTL `endedAt` + toIntervalDay(30)')).toEqual({ column: 'endedAt', days: 30 });
+      expect(parseTtlExpression('TTL `timestamp` + INTERVAL 7 DAY')).toEqual({ column: 'timestamp', days: 7 });
+    });
+
+    it('parseTtlExpression returns null when no TTL clause is present', () => {
+      expect(parseTtlExpression('ORDER BY (traceId, endedAt)')).toBeNull();
+      expect(parseTtlExpression('')).toBeNull();
+    });
+
     // --- Integration test: retention is applied during init ---
 
     it('init applies retention TTL to tables', async () => {
@@ -3478,6 +5067,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
       const signalTables = [
         'mastra_span_events',
         'mastra_trace_roots',
+        'mastra_trace_branches',
         'mastra_log_events',
         'mastra_metric_events',
         'mastra_score_events',
@@ -3496,6 +5086,7 @@ describe('ObservabilityStorageClickhouseVNext', () => {
         const expectedTTLs: Record<string, string> = {
           mastra_span_events: 'endedAt + toIntervalDay(30)',
           mastra_trace_roots: 'endedAt + toIntervalDay(30)',
+          mastra_trace_branches: 'endedAt + toIntervalDay(30)',
           mastra_log_events: 'timestamp + toIntervalDay(7)',
           mastra_metric_events: 'timestamp + toIntervalDay(14)',
           mastra_score_events: 'timestamp + toIntervalDay(90)',
@@ -3518,6 +5109,181 @@ describe('ObservabilityStorageClickhouseVNext', () => {
         for (const table of signalTables) {
           await client.command({ query: `ALTER TABLE ${table} REMOVE TTL` });
         }
+        await client.close();
+      }
+    });
+  });
+
+  // ==========================================================================
+  // init() idempotence
+  //
+  // Regression coverage for the metadata-version churn that hung agent streams
+  // when ClickHouse observability was configured. On Replicated/Shared
+  // MergeTree, every ALTER bumps the table's metadata version even when the
+  // change is a no-op, so init() must skip ALTERs whose target is already in
+  // place to avoid replica catch-up races on every process boot.
+  // ==========================================================================
+
+  describe('init idempotence', () => {
+    // --- Unit tests for ALL_MIGRATIONS shape ---
+
+    it('ALL_MIGRATIONS entries carry table + name consistent with their SQL', () => {
+      expect(ALL_MIGRATIONS.length).toBeGreaterThan(0);
+      for (const entry of ALL_MIGRATIONS) {
+        expect(entry.sql).toContain(`ALTER TABLE ${entry.table}`);
+        expect(entry.sql).toContain(entry.name);
+        if (entry.kind === 'column') {
+          expect(entry.sql).toContain('ADD COLUMN IF NOT EXISTS');
+        } else {
+          expect(entry.sql).toContain('ADD INDEX IF NOT EXISTS');
+        }
+      }
+    });
+
+    it('ALL_MIGRATIONS entry names are unique within (table, kind)', () => {
+      const seen = new Set<string>();
+      for (const entry of ALL_MIGRATIONS) {
+        const key = `${entry.kind}:${entry.table}:${entry.name}`;
+        expect(seen.has(key), `duplicate migration entry ${key}`).toBe(false);
+        seen.add(key);
+      }
+    });
+
+    // --- Integration tests: init() must not re-issue applied ALTERs ---
+
+    it('re-running init against a current schema emits zero ALTER statements', async () => {
+      const client = createClient({
+        url: process.env.CLICKHOUSE_URL || 'http://localhost:8123',
+        username: process.env.CLICKHOUSE_USERNAME || 'default',
+        password: process.env.CLICKHOUSE_PASSWORD || 'password',
+      });
+
+      try {
+        // First init brings the DB to the current schema.
+        const first = new ObservabilityStorageClickhouseVNext({ client });
+        await first.init();
+
+        // Wrap client.command so we can observe the second init's DDL traffic.
+        const originalCommand = client.command.bind(client);
+        const commands: string[] = [];
+        const spy = vi.spyOn(client, 'command').mockImplementation(async args => {
+          commands.push((args as { query: string }).query);
+          return originalCommand(args);
+        });
+
+        try {
+          const second = new ObservabilityStorageClickhouseVNext({ client });
+          await second.init();
+
+          const alters = commands.filter(q => /^\s*ALTER\s+TABLE/i.test(q));
+          expect(alters, `expected no ALTERs, got:\n${alters.join('\n')}`).toEqual([]);
+        } finally {
+          spy.mockRestore();
+        }
+      } finally {
+        await client.close();
+      }
+    });
+
+    it('changing retention only emits MODIFY TTL for tables whose value actually differs', async () => {
+      const client = createClient({
+        url: process.env.CLICKHOUSE_URL || 'http://localhost:8123',
+        username: process.env.CLICKHOUSE_USERNAME || 'default',
+        password: process.env.CLICKHOUSE_PASSWORD || 'password',
+      });
+
+      const signalTables = [
+        'mastra_span_events',
+        'mastra_trace_roots',
+        'mastra_trace_branches',
+        'mastra_log_events',
+        'mastra_metric_events',
+        'mastra_score_events',
+        'mastra_feedback_events',
+      ];
+
+      try {
+        // Establish baseline retention.
+        const first = new ObservabilityStorageClickhouseVNext({
+          client,
+          retention: { tracing: 30, logs: 7, metrics: 14 },
+        });
+        await first.init();
+
+        // Spy on the second init's DDL traffic.
+        const originalCommand = client.command.bind(client);
+        const commands: string[] = [];
+        const spy = vi.spyOn(client, 'command').mockImplementation(async args => {
+          commands.push((args as { query: string }).query);
+          return originalCommand(args);
+        });
+
+        try {
+          // Change only `logs`; leave tracing and metrics unchanged.
+          const second = new ObservabilityStorageClickhouseVNext({
+            client,
+            retention: { tracing: 30, logs: 21, metrics: 14 },
+          });
+          await second.init();
+
+          const ttlAlters = commands.filter(q => /MODIFY TTL/i.test(q));
+          expect(ttlAlters).toHaveLength(1);
+          expect(ttlAlters[0]).toContain('mastra_log_events');
+          expect(ttlAlters[0]).toContain('21 DAY');
+        } finally {
+          spy.mockRestore();
+        }
+      } finally {
+        // Clean up TTLs so other tests start from a clean state.
+        for (const table of signalTables) {
+          await client.command({ query: `ALTER TABLE ${table} REMOVE TTL` }).catch(() => {});
+        }
+        await client.close();
+      }
+    });
+
+    it('init still applies an ALTER for a column that was manually dropped', async () => {
+      const client = createClient({
+        url: process.env.CLICKHOUSE_URL || 'http://localhost:8123',
+        username: process.env.CLICKHOUSE_USERNAME || 'default',
+        password: process.env.CLICKHOUSE_PASSWORD || 'password',
+      });
+
+      // Pick a migration we know is additive and safe to drop/re-add.
+      const target = ALL_MIGRATIONS.find(
+        m => m.kind === 'column' && m.table === 'mastra_log_events' && m.name === 'entityVersionId',
+      );
+      expect(target).toBeDefined();
+
+      try {
+        await new ObservabilityStorageClickhouseVNext({ client }).init();
+        await client.command({
+          query: `ALTER TABLE ${target!.table} DROP COLUMN IF EXISTS ${target!.name}`,
+        });
+
+        const originalCommand = client.command.bind(client);
+        const commands: string[] = [];
+        const spy = vi.spyOn(client, 'command').mockImplementation(async args => {
+          commands.push((args as { query: string }).query);
+          return originalCommand(args);
+        });
+
+        try {
+          await new ObservabilityStorageClickhouseVNext({ client }).init();
+          const matched = commands.filter(q => q.includes(`ALTER TABLE ${target!.table}`) && q.includes(target!.name));
+          expect(matched).toHaveLength(1);
+        } finally {
+          spy.mockRestore();
+        }
+
+        // Verify column is back so subsequent tests see the expected schema.
+        const colResult = await client.query({
+          query: `SELECT name FROM system.columns WHERE database = currentDatabase() AND table = {table:String} AND name = {name:String}`,
+          query_params: { table: target!.table, name: target!.name },
+          format: 'JSONEachRow',
+        });
+        expect(((await colResult.json()) as unknown[]).length).toBe(1);
+      } finally {
         await client.close();
       }
     });
@@ -3551,6 +5317,27 @@ async function triggerDiscoveryRefresh(): Promise<void> {
   } finally {
     await client.close();
   }
+}
+
+async function waitForValue<T>(
+  fn: () => Promise<T>,
+  predicate: (value: T) => boolean,
+  opts: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<T> {
+  const timeoutMs = opts.timeoutMs ?? 5000;
+  const intervalMs = opts.intervalMs ?? 100;
+  const deadline = Date.now() + timeoutMs;
+
+  let lastValue: T | undefined;
+  while (Date.now() < deadline) {
+    lastValue = await fn();
+    if (predicate(lastValue)) {
+      return lastValue;
+    }
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+  }
+
+  throw new Error(`Timed out waiting for expected value. Last value: ${JSON.stringify(lastValue)}`);
 }
 
 /**

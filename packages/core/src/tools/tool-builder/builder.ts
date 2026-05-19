@@ -12,6 +12,7 @@ import {
   jsonSchema,
 } from '@mastra/schema-compat';
 import { z } from 'zod/v4';
+import { MastraFGAPermissions } from '../../auth/ee';
 import { backgroundOverrideJsonSchema, backgroundOverrideZodSchema } from '../../background-tasks';
 import { MastraBase } from '../../base';
 import { ErrorCategory, MastraError, ErrorDomain } from '../../error';
@@ -312,6 +313,7 @@ export class CoreToolBuilder extends MastraBase {
             )
           : undefined,
         toModelOutput: 'toModelOutput' in this.originalTool ? this.originalTool.toModelOutput : undefined,
+        transform: 'transform' in this.originalTool ? this.originalTool.transform : undefined,
         inputExamples: 'inputExamples' in this.originalTool ? this.originalTool.inputExamples : undefined,
       } as unknown as (CoreTool & { id: `${string}.${string}` }) | undefined;
     }
@@ -459,6 +461,7 @@ export class CoreToolBuilder extends MastraBase {
                 threadId,
                 resourceId,
                 outputWriter: execOptions.outputWriter,
+                flushMessages: execOptions.flushMessages,
               },
             };
           } else if (isWorkflowExecution) {
@@ -570,6 +573,37 @@ export class CoreToolBuilder extends MastraBase {
         requestContext: toolRequestContext,
         mastra: options.mastra && 'observability' in options.mastra ? (options.mastra as Mastra) : undefined,
       });
+
+      const fgaProvider = (options.mastra as any)?.getServer?.()?.fga;
+      const user = toolRequestContext?.get('user');
+      if (fgaProvider) {
+        const { getAgentToolFGAResourceId, getMCPToolFGAResourceId, getStandaloneToolFGAResourceId, requireFGA } =
+          await import('../../auth/ee/fga-check');
+        const toolResourceId = mcpMeta?.serverName
+          ? getMCPToolFGAResourceId(mcpMeta.serverName, options.name)
+          : options.agentId
+            ? getAgentToolFGAResourceId(options.agentId, options.name)
+            : getStandaloneToolFGAResourceId(options.name);
+        await requireFGA({
+          fgaProvider,
+          user,
+          resource: { type: 'tool', id: toolResourceId },
+          permission: MastraFGAPermissions.TOOLS_EXECUTE,
+          requestContext: toolRequestContext,
+          context: {
+            resourceId: options.resourceId,
+          },
+          metadata: {
+            toolName: options.name,
+            agentId: options.agentId,
+            agentName: options.agentName,
+            runId: options.runId,
+            threadId: options.threadId,
+            executionResourceId: options.resourceId,
+            mcpMetadata: mcpMeta,
+          },
+        });
+      }
 
       try {
         logger.debug(start, { ...logData, ...rest, model: logModelObject, args });
@@ -760,13 +794,22 @@ export class CoreToolBuilder extends MastraBase {
 
     // Map AI SDK's needsApproval to our requireApproval
     // needsApproval can be boolean or a function that takes input and returns boolean
-    let requireApproval = this.options.requireApproval;
+    let requireApproval = false;
     let needsApprovalFn: ((input: any) => boolean | Promise<boolean>) | undefined;
+
+    if (typeof this.options.requireApproval === 'function') {
+      requireApproval = true;
+      needsApprovalFn = this.options.requireApproval;
+    } else if (typeof this.options.requireApproval === 'boolean') {
+      requireApproval = this.options.requireApproval;
+      needsApprovalFn = undefined;
+    }
 
     if (isVercelTool(this.originalTool) && 'needsApproval' in this.originalTool) {
       const needsApproval = (this.originalTool as any).needsApproval;
       if (typeof needsApproval === 'boolean') {
         requireApproval = needsApproval;
+        needsApprovalFn = undefined;
       } else if (typeof needsApproval === 'function') {
         // Store the function to evaluate it per-call
         needsApprovalFn = needsApproval;
@@ -799,6 +842,7 @@ export class CoreToolBuilder extends MastraBase {
       providerOptions: 'providerOptions' in this.originalTool ? this.originalTool.providerOptions : undefined,
       mcp: 'mcp' in this.originalTool ? this.originalTool.mcp : undefined,
       toModelOutput: 'toModelOutput' in this.originalTool ? this.originalTool.toModelOutput : undefined,
+      transform: 'transform' in this.originalTool ? this.originalTool.transform : undefined,
       inputExamples: 'inputExamples' in this.originalTool ? this.originalTool.inputExamples : undefined,
       onInputStart: 'onInputStart' in this.originalTool ? this.originalTool.onInputStart : undefined,
       onInputDelta: 'onInputDelta' in this.originalTool ? this.originalTool.onInputDelta : undefined,
